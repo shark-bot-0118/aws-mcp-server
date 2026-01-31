@@ -1,0 +1,448 @@
+# AWS MCP ツール実行例まとめ (成功例)
+
+これまでの試行で成功した、AWS CLI MCP サーバーの `aws_execute` ツールを用いた実行例です。
+
+## 1. Lambda 関数のリスト取得
+```json
+{
+  "service": "lambda",
+  "operation": "ListFunctions",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 24. Lambda 関数の新規作成
+ローカルのZipファイルをBase64エンコードしてアップロードします。
+```json
+{
+  "service": "lambda",
+  "operation": "CreateFunction",
+  "action": "invoke",
+  "payload": {
+    "FunctionName": "test-lambda-0130",
+    "Runtime": "python3.13",
+    "Role": "arn:aws:iam::123456789012:role/service-role/your-role",
+    "Handler": "lambda_function.lambda_handler",
+    "Code": {
+      "ZipFile": "BASE64_ENCODED_DATA"
+    }
+  }
+}
+```
+
+## 25. Lambda 関数のコード更新 (デプロイ)
+```json
+{
+  "service": "lambda",
+  "operation": "UpdateFunctionCode",
+  "action": "invoke",
+  "payload": {
+    "FunctionName": "test-lambda-0130",
+    "ZipFile": "BASE64_ENCODED_DATA"
+  }
+}
+```
+
+## 26. Lambda 関数の詳細取得
+ソースコードのダウンロードURL等を取得できます。
+```json
+{
+  "service": "lambda",
+  "operation": "GetFunction",
+  "action": "invoke",
+  "payload": {
+    "FunctionName": "your-function-name"
+  }
+}
+```
+
+## 27. Lambda 関数の削除 (要承認スキップ)
+```json
+{
+  "service": "lambda",
+  "operation": "DeleteFunction",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "FunctionName": "your-function-name"
+  }
+}
+```
+
+## 28. KMS キーおよびエイリアスの一覧取得
+```json
+{
+  "service": "kms",
+  "operation": "ListKeys",
+  "action": "invoke",
+  "payload": {}
+}
+```
+エイリアス（表示名）を含めて取得する場合：
+```json
+{
+  "service": "kms",
+  "operation": "ListAliases",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 29. CloudFormation スタックの一覧取得
+```json
+{
+  "service": "cloudformation",
+  "operation": "ListStacks",
+  "action": "invoke",
+  "payload": {
+    "StackStatusFilter": ["CREATE_COMPLETE", "UPDATE_COMPLETE"]
+  }
+}
+```
+
+## 30. CloudFormation スタックの作成
+`TemplateBody` にテンプレートの YAML/JSON 文字列を渡します。
+```json
+{
+  "service": "cloudformation",
+  "operation": "CreateStack",
+  "action": "invoke",
+  "payload": {
+    "StackName": "YourStackName",
+    "TemplateBody": "AWSTemplateFormatVersion: '2010-09-09'\nResources: ..."
+  }
+}
+```
+
+## 31. CloudFormation スタックの状況確認
+```json
+{
+  "service": "cloudformation",
+  "operation": "DescribeStacks",
+  "action": "invoke",
+  "payload": {
+    "StackName": "YourStackName"
+  }
+}
+```
+
+## 32. CloudFormation スタックの削除 (要承認スキップ)
+```json
+{
+  "service": "cloudformation",
+  "operation": "DeleteStack",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "StackName": "YourStackName"
+  }
+}
+```
+
+## 2. S3 バケットのリスト取得
+```json
+{
+  "service": "s3",
+  "operation": "ListBuckets",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 3. S3 バケットの作成 (ap-northeast-1)
+```json
+{
+  "service": "s3",
+  "operation": "CreateBucket",
+  "action": "invoke",
+  "payload": {
+    "Bucket": "your-bucket-name",
+    "CreateBucketConfiguration": {
+      "LocationConstraint": "ap-northeast-1"
+    }
+  }
+}
+```
+
+## 4. S3 オブジェクトのアップロード (PutObject)
+```json
+{
+  "service": "s3",
+  "operation": "PutObject",
+  "action": "invoke",
+  "payload": {
+    "Bucket": "your-bucket-name",
+    "Key": "test.txt",
+    "Body": "Hello S3!"
+  }
+}
+```
+
+## 5. S3 オブジェクトの取得 (GetObject)
+※Bodyの読み取りにはサーバー側の対応が必要です。
+```json
+{
+  "service": "s3",
+  "operation": "GetObject",
+  "action": "invoke",
+  "payload": {
+    "Bucket": "your-bucket-name",
+    "Key": "test.txt"
+  }
+}
+```
+
+## 6. S3 オブジェクトの削除 (要承認スキップ)
+破壊的な操作には `options` キーでの承認スキップが必要な場合があります。
+```json
+{
+  "service": "s3",
+  "operation": "DeleteObject",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "Bucket": "your-bucket-name",
+    "Key": "test.txt"
+  }
+}
+```
+
+## 7. S3 バケットの削除 (要承認スキップ)
+```json
+{
+  "service": "s3",
+  "operation": "DeleteBucket",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "Bucket": "your-bucket-name"
+  }
+}
+```
+
+## 8. DynamoDB テーブル一覧の取得
+```json
+{
+  "service": "dynamodb",
+  "operation": "ListTables",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 9. DynamoDB テーブルのスキャン (Scan)
+※数値パラメータ（Limitなど）は型矛盾でエラーになる可能性があるため注意。
+```json
+{
+  "service": "dynamodb",
+  "operation": "Scan",
+  "action": "invoke",
+  "payload": {
+    "TableName": "your-table-name"
+  }
+}
+```
+
+## 10. DynamoDB テーブルの作成 (CreateTable)
+数値パラメータを避けるため、 BillingMode をオンデマンドに設定した例。
+```json
+{
+  "service": "dynamodb",
+  "operation": "CreateTable",
+  "action": "invoke",
+  "payload": {
+    "TableName": "TestTable_26_0129",
+    "AttributeDefinitions": [
+      {
+        "AttributeName": "Id",
+        "AttributeType": "S"
+      }
+    ],
+    "KeySchema": [
+      {
+        "AttributeName": "Id",
+        "KeyType": "HASH"
+      }
+    ],
+    "BillingMode": "PAY_PER_REQUEST"
+  }
+}
+```
+
+## 11. DynamoDB へのデータ書き込み (PutItem)
+型指定オブジェクト（{"S": "...", "N": "...", "BOOL": true, "L": [...], "M": {...}, "NULL": true}）を用いた書き込み例。
+```json
+{
+  "service": "dynamodb",
+  "operation": "PutItem",
+  "action": "invoke",
+  "payload": {
+    "TableName": "TestTable_26_0129",
+    "Item": {
+      "Id": { "S": "4" },
+      "Name": { "S": "Full Support Test" },
+      "Score": { "N": "100" },
+      "IsActive": { "BOOL": true },
+      "Tags": { "L": [{ "S": "aws" }, { "S": "mcp" }] },
+      "Metadata": { "M": { "Version": { "S": "1.0" } } },
+      "Note": { "NULL": true }
+    }
+  }
+}
+```
+
+## 12. DynamoDB テーブルの削除 (要承認スキップ)
+```json
+{
+  "service": "dynamodb",
+  "operation": "DeleteTable",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "TableName": "your-table-name"
+  }
+}
+```
+
+## 13. EC2 インスタンスの一覧取得
+```json
+{
+  "service": "ec2",
+  "operation": "DescribeInstances",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 14. EC2 起動用 AMI ID の検索 (Amazon Linux 2023 / arm64)
+```json
+{
+  "service": "ec2",
+  "operation": "DescribeImages",
+  "action": "invoke",
+  "payload": {
+    "Filters": [
+      { "Name": "name", "Values": ["al2023-ami-2023*-kernel-6.1-arm64"] },
+      { "Name": "owner-alias", "Values": ["amazon"] }
+    ]
+  }
+}
+```
+
+## 15. EC2 インスタンスの起動 (t4g.nano)
+```json
+{
+  "service": "ec2",
+  "operation": "RunInstances",
+  "action": "invoke",
+  "payload": {
+    "ImageId": "ami-xxxxxxxxxxxxxxxxx",
+    "InstanceType": "t4g.nano",
+    "MinCount": 1,
+    "MaxCount": 1
+  }
+}
+```
+
+## 16. EC2 インスタンスの停止 (要承認スキップ)
+```json
+{
+  "service": "ec2",
+  "operation": "StopInstances",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "InstanceIds": ["i-xxxxxxxxxxxxxxxxx"]
+  }
+}
+```
+
+## 17. EBS ボリュームの一覧取得
+```json
+{
+  "service": "ec2",
+  "operation": "DescribeVolumes",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 18. EC2 インスタンス의 削除 / Terminate (要承認スキップ)
+```json
+{
+  "service": "ec2",
+  "operation": "TerminateInstances",
+  "action": "invoke",
+  "options": {
+    "skipApproval": true
+  },
+  "payload": {
+    "InstanceIds": ["i-xxxxxxxxxxxxxxxxx"]
+  }
+}
+```
+
+## 19. EC2 インスタンスタイプのスペック情報取得
+```json
+{
+  "service": "ec2",
+  "operation": "DescribeInstanceTypes",
+  "action": "invoke",
+  "payload": {
+    "InstanceTypes": ["t3.nano", "t4g.nano"]
+  }
+}
+```
+
+## 20. RDS インスタンスの一覧取得
+操作名に `DB` が含まれる場合でも、正常に実行可能です。
+```json
+{
+  "service": "rds",
+  "operation": "DescribeDBInstances",
+  "action": "invoke",
+  "payload": {}
+}
+```
+
+## 21. RDS 注文可能なインスタンスオプションの検索
+エンジンやバージョンを指定して、利用可能なインスタンスクラスやストレージオプションを検索します。
+```json
+{
+  "service": "rds",
+  "operation": "DescribeOrderableDBInstanceOptions",
+  "action": "invoke",
+  "payload": {
+    "Engine": "mysql",
+    "EngineVersion": "8.0.44",
+    "DBInstanceClass": "db.t4g.micro"
+  }
+}
+```
+
+## 22. RDS エンジンバージョンの取得
+利用可能なデータベースエンジンとそのバージョンのリストを取得します。
+```json
+{
+  "service": "rds",
+  "operation": "DescribeDBEngineVersions",
+  "action": "invoke",
+  "payload": {
+    "Engine": "mysql",
+    "MaxRecords": 20
+  }
+}
+```

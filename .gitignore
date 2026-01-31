@@ -1,0 +1,60 @@
+# Python関連
+__pycache__/
+.venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+
+# 環境変数ファイル（機密情報）
+.env
+.env.*
+!.env.example
+
+# Data & Database
+data/
+
+# ログファイル
+log/
+*.log
+
+# 仮想環境
+venv/
+env/
+ENV/
+
+# IDEやエディタの設定
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+
+# AWS関連
+.aws/
+credentials/
+*.pem
+
+# その他
+temp/
+tmp/
+scripts/
+.coverage
+htmlcov/ 

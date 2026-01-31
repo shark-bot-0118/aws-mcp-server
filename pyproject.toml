@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aws-cli-mcp"
+version = "0.1.0"
+description = "Model Context Protocol server that exposes vetted AWS CLI and SDK tools"
+authors = [
+  { name = "Shuto", email = "" }
+]
+requires-python = ">=3.11"
+license = { text = "MIT" }
+readme = "README.md"
+dependencies = [
+  "boto3>=1.34",
+  "pydantic>=2.6",
+  "python-dotenv>=1.0",
+  "jsonschema>=4.22",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-cov",
+  "ruff",
+  "mypy",
+]
+runtime = [
+  "fastmcp>=2.11.4",
+]
+
+[tool.hatch.build.targets.wheel]
+package-dir = "src"
+packages = ["aws_cli_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/aws_cli_mcp",
+  "README.md",
+  "docs",
+  "pyproject.toml",
+  ".env.example",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

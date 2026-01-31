@@ -1,0 +1,66 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.iam#AWSIdentityManagement": {
+      "type": "service",
+      "version": "2010-05-08",
+      "traits": {
+        "aws.api#service": {
+          "sdkId": "IAM",
+          "endpointPrefix": "iam"
+        }
+      },
+      "operations": [
+        {"target": "com.amazonaws.iam#ListUsers"},
+        {"target": "com.amazonaws.iam#CreateRole"}
+      ]
+    },
+    "com.amazonaws.iam#ListUsers": {
+      "type": "operation",
+      "input": {"target": "com.amazonaws.iam#ListUsersRequest"},
+      "traits": {
+        "smithy.api#documentation": "Lists the IAM users."
+      }
+    },
+    "com.amazonaws.iam#CreateRole": {
+      "type": "operation",
+      "input": {"target": "com.amazonaws.iam#CreateRoleRequest"},
+      "traits": {
+        "smithy.api#documentation": "Creates a new IAM role."
+      }
+    },
+    "com.amazonaws.iam#ListUsersRequest": {
+      "type": "structure",
+      "members": {
+        "MaxItems": {"target": "smithy.api#Integer"}
+      }
+    },
+    "com.amazonaws.iam#CreateRoleRequest": {
+      "type": "structure",
+      "members": {
+        "RoleName": {
+          "target": "smithy.api#String",
+          "traits": {"smithy.api#required": {}}
+        },
+        "AssumeRolePolicyDocument": {
+          "target": "smithy.api#String",
+          "traits": {"smithy.api#required": {}}
+        },
+        "Tags": {"target": "com.amazonaws.iam#TagList"}
+      }
+    },
+    "com.amazonaws.iam#TagList": {
+      "type": "list",
+      "member": {"target": "com.amazonaws.iam#Tag"}
+    },
+    "com.amazonaws.iam#Tag": {
+      "type": "structure",
+      "members": {
+        "Key": {"target": "smithy.api#String"},
+        "Value": {"target": "smithy.api#String"}
+      }
+    },
+    "smithy.api#String": {"type": "string"},
+    "smithy.api#Integer": {"type": "integer"}
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.ec2#AmazonEC2": {
+      "type": "service",
+      "version": "2016-11-15",
+      "traits": {
+        "aws.api#service": {
+          "sdkId": "EC2",
+          "endpointPrefix": "ec2"
+        }
+      },
+      "operations": [
+        {"target": "com.amazonaws.ec2#DescribeInstances"},
+        {"target": "com.amazonaws.ec2#RunInstances"}
+      ]
+    },
+    "com.amazonaws.ec2#DescribeInstances": {
+      "type": "operation",
+      "input": {"target": "com.amazonaws.ec2#DescribeInstancesRequest"},
+      "traits": {
+        "smithy.api#documentation": "Describes one or more of your instances."
+      }
+    },
+    "com.amazonaws.ec2#RunInstances": {
+      "type": "operation",
+      "input": {"target": "com.amazonaws.ec2#RunInstancesRequest"},
+      "traits": {
+        "smithy.api#documentation": "Launches an EC2 instance."
+      }
+    },
+    "com.amazonaws.ec2#DescribeInstancesRequest": {
+      "type": "structure",
+      "members": {
+        "InstanceIds": {"target": "com.amazonaws.ec2#InstanceIdList"}
+      }
+    },
+    "com.amazonaws.ec2#RunInstancesRequest": {
+      "type": "structure",
+      "members": {
+        "ImageId": {
+          "target": "smithy.api#String",
+          "traits": {"smithy.api#required": {}}
+        },
+        "MinCount": {
+          "target": "smithy.api#Integer",
+          "traits": {"smithy.api#required": {}}
+        },
+        "MaxCount": {
+          "target": "smithy.api#Integer",
+          "traits": {"smithy.api#required": {}}
+        },
+        "TagSpecifications": {"target": "com.amazonaws.ec2#TagSpecificationList"},
+        "ClientToken": {
+          "target": "smithy.api#String",
+          "traits": {"smithy.api#idempotencyToken": {}}
+        }
+      }
+    },
+    "com.amazonaws.ec2#InstanceIdList": {
+      "type": "list",
+      "member": {"target": "smithy.api#String"}
+    },
+    "com.amazonaws.ec2#TagSpecificationList": {
+      "type": "list",
+      "member": {"target": "com.amazonaws.ec2#TagSpecification"}
+    },
+    "com.amazonaws.ec2#TagSpecification": {
+      "type": "structure",
+      "members": {
+        "ResourceType": {"target": "smithy.api#String"},
+        "Tags": {"target": "com.amazonaws.ec2#TagList"}
+      }
+    },
+    "com.amazonaws.ec2#TagList": {
+      "type": "list",
+      "member": {"target": "com.amazonaws.ec2#Tag"}
+    },
+    "com.amazonaws.ec2#Tag": {
+      "type": "structure",
+      "members": {
+        "Key": {"target": "smithy.api#String"},
+        "Value": {"target": "smithy.api#String"}
+      }
+    },
+    "smithy.api#String": {"type": "string"},
+    "smithy.api#Integer": {"type": "integer"}
+  }
+}

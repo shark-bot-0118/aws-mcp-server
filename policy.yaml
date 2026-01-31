@@ -1,0 +1,120 @@
+version: 1
+
+defaults:
+  deny_destructive: true
+  require_approval_for_destructive: true
+  require_approval_for_risk:
+    - high
+
+services:
+  allowlist:
+    - ec2
+    - iam
+    - lambda
+    - s3
+    - rds
+    - dynamodb
+    - route53
+    - route53domains
+    - cloudwatch
+    - cloudfront
+    - kms
+    - cloudformation
+    - apigateway
+    - ssm
+  denylist: []
+
+rules:
+  allow:
+    - "^sts:GetCallerIdentity$"
+    - "^ec2:Describe.*$"
+    - "^iam:List.*$"
+    - "^iam:Get.*$"
+    - "^iam:Create.*$"
+    - "^iam:Update.*$"
+    - "^iam:Delete.*$"
+    - "^iam:Remove.*$"
+    - "^iam:Put.*$"
+    - "^iam:Attach.*$"
+    - "^iam:Detach.*$"
+    - "^lambda:List.*$"
+    - "^lambda:Get.*$"
+    - "^lambda:Create.*$"
+    - "^lambda:Delete.*$"
+    - "^lambda:Update.*$"
+    - "^s3:List.*$"
+    - "^s3:Get.*$"
+    - "^s3:Create.*$"
+    - "^s3:Delete.*$"
+    - "^s3:Put.*$"
+    - "^rds:Describe.*$"
+    - "^rds:List.*$"
+    - "^dynamodb:Describe.*$"
+    - "^dynamodb:List.*$"
+    - "^dynamodb:CreateTable$"
+    - "^dynamodb:DeleteTable$"
+    - "^dynamodb:PutItem$"
+    - "^dynamodb:GetItem$"
+    - "^dynamodb:DeleteItem$"
+    - "^dynamodb:UpdateItem$"
+    - "^dynamodb:Query$"
+    - "^dynamodb:Scan$"
+    - "^route53:List.*$"
+    - "^route53:Get.*$"
+    - "^route53domains:List.*$"
+    - "^route53domains:Get.*$"
+    - "^route53domains:Check.*$"
+    - "^route53domains:Create.*$"
+    - "^cloudwatch:List.*$"
+    - "^cloudwatch:Get.*$"
+    - "^cloudwatch:Describe.*$"
+    - "^cloudfront:List.*$"
+    - "^cloudfront:Get.*$"
+    - "^cloudfront:Create.*$"
+    - "^cloudfront:Update.*$"
+    - "^kms:List.*$"
+    - "^kms:Describe.*$"
+    - "^kms:Get.*$"
+    - "^cloudformation:List.*$"
+    - "^cloudformation:Describe.*$"
+    - "^cloudformation:Get.*$"
+    - "^cloudformation:CreateStack.*$"
+    - "^cloudformation:DeleteStack.*$"
+    - "^cloudformation:UpdateStack.*$"
+    - "^apigateway:GET.*$"
+    - "^ssm:List.*$"
+    - "^ssm:Get.*$"
+    - "^ssm:Describe.*$"
+    - "^ec2:StartInstances$"
+    - "^ec2:StopInstances$"
+    - "^ec2:TerminateInstances$"
+    - "^ec2:RunInstances$"
+    - "^ec2:CreateVolume$"
+    - "^ec2:DeleteVolume$"
+    - "^ec2:AttachVolume$"
+    - "^ec2:DetachVolume$"
+  deny:
+
+destructive_patterns:
+  - "Delete"
+  - "Terminate"
+  - "Destroy"
+  - "Stop"
+  - "Detach"
+
+risk_patterns:
+  high:
+    - "Delete"
+    - "Terminate"
+    - "Destroy"
+    - "Detach"
+  medium:
+    - "Update"
+    - "Modify"
+
+# required_tags:
+#   - key: "Owner"
+#     pattern: ".+"
+
+approval:
+  ttl_seconds: 3600
