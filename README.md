@@ -1,440 +1,216 @@
 # AWS Tool-Execution MCP Server
 
-Model Context Protocol (MCP) server that exposes safe, policy-governed AWS operations to LLM clients using a unified 3-tool architecture.
+A robust, enterprise-grade Model Context Protocol (MCP) server that empowers LLMs to safely interact with your AWS environment. Built with a **"Validate-then-Invoke"** architecture and a **Dual Permission System**, it provides a secure bridge between AI agents and AWS infrastructure.
 
-All executions are audited with `tx_id`/`op_id` and are gated by **Dual Permission** (IAM + Policy) and (when required) human approval.
+## 🌟 Key Features
 
-## 🚀 Getting Started
+*   **🛡️ Dual Permission System**: Security enforced at two levels—AWS IAM (Cloud) and `policy.yaml` (Local). Deny rules always take precedence.
+*   **🚦 Human-in-the-Loop Safety**: Destructive operations (delete, terminate, stop) automatically trigger a confirmation flow, preventing accidental data loss.
+*   **🔁 Dynamic Capabilities**: Access almost any AWS service (S3, Lambda, EC2, DynamoDB, etc.) dynamically powered by AWS Smithy models. No hardcoded tools.
+*   **📂 Local File Integration**: Seamlessly upload local files and folders to S3 or Lambda using the `$path` syntax.
+*   **📝 Audit Logging**: All interactions are audited locally with transaction IDs and operation details for full traceability.
+*   **✅ 3-Tool Architecture**: Simplifies the context window by exposing only three unified tools instead of hundreds of individual functions.
 
-### 1. Install Dependencies
+---
+
+## � Getting Started
+
+### Prerequisites
+
+*   **Python 3.11+**
+*   **AWS CLI** installed and configured (or valid environment variables).
+*   **MCP Client** (e.g., Claude Desktop, Zed, or any MCP-compatible agent).
+
+### Installation
+
+1.  **Clone the repository**:
+    ```bash
+    git clone https://github.com/your-org/aws-cli-mcp.git
+    cd aws-cli-mcp
+    ```
+
+2.  **Install dependencies**:
+    ```bash
+    pip install -e .
+    ```
+
+3.  **Configure Environment**:
+    Copy the example configuration:
+    ```bash
+    cp .env.example .env
+    ```
+    Edit `.env` to match your setup (see [Configuration](#-configuration) below).
+
+### Running the Server
+
+You can run the server directly via Python:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
-# Optional: pip install -e .[runtime] (for FastMCP)
+python server.py
 ```
 
-### 2. Configure Credentials
-Copy `.env.example` to `.env` and set your AWS keys/region.
-Ensure your AWS CLI environment is authenticated (`aws sts get-caller-identity`).
+Or configure it in your MCP Client (e.g., `claude_desktop_config.json`):
 
-### 3. Run Server
-```bash
-python -m aws_cli_mcp.server
-```
-
----
-
-## 🛠 Core Workflow (3-Tool Architecture)
-
-This server simplifies AWS interaction into **3 unified tools**.
-Recommended flow for agents:
-
-```mermaid
-flowchart LR
-    Search[1. Search Operations] --> Schema[2. Get Schema]
-    Schema --> Validate[3. Validate Payload]
-    Validate --> Execute[4. Execute Operation]
-```
-
-### Step 1: `aws.searchOperations`
-Find the correct operation and service name from Smithy models.
-*Example:* "I need to list simple storage buckets" -> Finds `s3:ListBuckets`.
-
-### Step 2: `aws.getOperationSchema`
-Get the exact JSON Schema for params.
-*Example:* Returns valid inputs for `s3:ListBuckets`.
-
-### Step 3: `aws.execute` (action="validate")
-Check against schema and policy *before* touching AWS.
-*Example:* "Is `BucketName` correct? Am I allowed to run this?"
-
-### Step 4: `aws.execute` (action="invoke")
-Execute the actual AWS API call.
-*Example:* Actually lists the buckets.
-
----
-
-## 🔒 Security & Architecture
-
-### Dual Permission Management (Defense in Depth)
-An operation is allowed **ONLY IF** it passes **BOTH** checks:
-1.  **AWS IAM Layer**: The underlying AWS credentials must have permission.
-2.  **MCP Policy Layer** (`policy.yaml`): The server's internal allowlist must permit it.
-
-> [!IMPORTANT]
-> **Deny Precedence**: If `policy.yaml` has a DENY rule (e.g., `Delete*`), it **overrides** any IAM permissions. Even if the underlying IAM user is `AdministratorAccess`, the MCP server will refuse to execute banned commands.
-
-### Operational Protection
-- **Destructive Confirmation**: Operations like `TerminateInstances` trigger a strict confirmation flow. The server returns a **Confirmation Token** (valid for 1 hour) which must be presented to proceed.
-- **Lazy Cleanup**: Expired tokens are automatically purged from the system.
-
----
-
-## 📦 Smithy Model Integration
-
-The server derives its capabilities *dynamically* from AWS [Smithy Models](https://github.com/aws/api-models-aws).
-
-### Auto-Sync & Daily Updates
-By default (`SMITHY_AUTO_SYNC=true`), the server clones the official AWS repository on startup.
-- **Benefit**: You automatically support new AWS services and API updates without code changes.
-- **Requirement**: Execution methods and schemas change daily. **Always** use `getOperationSchema` to verify the latest parameters rather than hardcoding payloads.
-
-### Version Pinning
-For stable production environments, you can pin a specific commit SHA via `.env`:
-```bash
-SMITHY_DEFAULT_MODEL_VERSION=commit_sha_here
-SMITHY_AUTO_SYNC=false
-```
-This ensures your agent sees a frozen view of the AWS API.
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables (.env)
-- `SMITHY_SYNC_URL`: Upstream repo URL.
-- `SMITHY_MODEL_PATH`: Local cache path.
-- `AWS_MCP_AUTO_APPROVE_DESTRUCTIVE`: Bypass confirmation (Use with caution!).
-- `LOG_LEVEL`: `INFO` or `DEBUG`.
-
-### Policy Configuration (policy.yaml)
-Controls the **MCP Policy Layer**.
-```yaml
-services:
-  allowlist:
-    - s3
-    - lambda
-  denylist:
-    - iam # Explicitly block sensitive services
-rules:
-  deny:
-    - "^Delete.*" # Global ban on deletion
-```
-
----
-
-## 📚 Tool Reference
-
-### 1. `aws.searchOperations`
-**Input**: `{"query": "lambda list", "serviceHint": "lambda"}`
-**Output**: List of operations with descriptions and risk levels.
-
-### 2. `aws.getOperationSchema`
-**Input**: `{"service": "lambda", "operation": "Invoke"}`
-**Output**: JSON Schema of the input payload.
-
-### 3. `aws.execute`
-**Input**:
 ```json
 {
-  "action": "invoke",
-  "service": "lambda",
-  "operation": "Invoke",
-  "payload": { "FunctionName": "my-func" },
-  "options": { "confirmationToken": "..." }
+  "mcpServers": {
+    "aws": {
+      "command": "/path/to/venv/bin/python",
+      "args": ["/path/to/aws-cli-mcp/server.py"]
+    }
+  }
 }
 ```
 
 ---
 
-## 📋 Appendix: Supported Services
+## 🛠 Usage Guide
 
-This list is dynamically generated from the Smithy models.
-(Add to `services.allowlist` in `policy.yaml` to enable).
+The server exposes **3 core tools** that handle the entire workflow. This design ensures that the LLM first understands *what* it can do and *how* to do it before execution.
 
-<details>
-<summary>Click to view all 300+ supported AWS Services</summary>
+### 1. `aws.searchOperations`
+**Purpose**: Find the correct AWS service and operation name.
+*   **Input**: `{"query": "list buckets", "serviceHint": "s3"}`
+*   **Output**: A list of matching operations (e.g., `s3:ListBuckets`) with descriptions and risk levels.
 
-- accessanalyzer
-- account
-- acm
-- acm-pca
-- aiops
-- amp
-- amplify
-- amplifybackend
-- amplifyuibuilder
-- apigateway
-- appconfig
-- appconfigdata
-- appfabric
-- appflow
-- application-autoscaling
-- application-signals
-- appmesh
-- apprunner
-- appsync
-- arc-region-switch
-- arc-zonal-shift
-- artifact
-- athena
-- auditmanager
-- autoscaling
-- autoscaling-plans
-- b2bi
-- backup
-- backup-gateway
-- batch
-- bcm-dashboards
-- bcm-data-exports
-- bcm-recommended-actions
-- bedrock
-- bedrock-agent
-- bedrock-agent-runtime
-- bedrock-agentcore
-- bedrock-agentcore-control
-- bedrock-data-automation
-- bedrock-data-automation-runtime
-- bedrock-runtime
-- billing
-- billingconductor
-- braket
-- budgets
-- ce
-- chatbot
-- chime
-- cleanrooms
-- cleanroomsml
-- cloud9
-- clouddirectory
-- cloudformation
-- cloudfront
-- cloudfront-keyvaluestore
-- cloudhsm
-- cloudhsmv2
-- cloudsearch
-- cloudsearchdomain
-- cloudtrail
-- cloudtrail-data
-- codeartifact
-- codebuild
-- codecatalyst
-- codecommit
-- codeconnections
-- codedeploy
-- codeguru-reviewer
-- codepipeline
-- codestar-connections
-- codestar-notifications
-- cognito-identity
-- cognito-idp
-- cognito-sync
-- comprehend
-- comprehendmedical
-- compute-optimizer
-- config
-- connect
-- connectcampaigns
-- connectcampaignsv2
-- controlcatalog
-- controltower
-- cost-optimization-hub
-- cur
-- databrew
-- dataexchange
-- datapipeline
-- datasync
-- datazone
-- dax
-- deadline
-- devicefarm
-- devops-guru
-- directconnect
-- discovery
-- dlm
-- dms
-- drs
-- ds
-- ds-data
-- dsql
-- dynamodb
-- ebs
-- ec2
-- ec2-instance-connect
-- ecs
-- eks
-- eks-auth
-- elasticache
-- elasticbeanstalk
-- emr-containers
-- entityresolution
-- es
-- events
-- evidently
-- evs
-- finspace
-- firehose
-- fis
-- fms
-- forecast
-- forecastquery
-- frauddetector
-- freetier
-- fsx
-- gamelift
-- gameliftstreams
-- glacier
-- globalaccelerator
-- glue
-- grafana
-- greengrass
-- groundstation
-- guardduty
-- health
-- healthlake
-- iam
-- identitystore
-- imagebuilder
-- inspector
-- inspector2
-- internetmonitor
-- invoicing
-- iot
-- iotanalytics
-- iotevents
-- iotfleetwise
-- iotsitewise
-- iotthingsgraph
-- iottwinmaker
-- ivs
-- ivschat
-- kafka
-- kafkaconnect
-- kendra
-- kendra-ranking
-- kinesis
-- kinesisanalytics
-- kinesisvideo
-- kms
-- lakeformation
-- lambda
-- license-manager
-- lightsail
-- location
-- logs
-- lookoutequipment
-- m2
-- machinelearning
-- macie2
-- managedblockchain
-- marketplacecommerceanalytics
-- mediaconnect
-- mediaconvert
-- medialive
-- mediapackage
-- mediapackage-vod
-- mediapackagev2
-- mediastore
-- medical-imaging
-- mgh
-- mgn
-- migrationhub-config
-- mpa
-- mq
-- mwaa
-- neptunedata
-- network-firewall
-- networkflowmonitor
-- networkmanager
-- networkmonitor
-- notifications
-- nova-act
-- oam
-- observabilityadmin
-- odb
-- omics
-- opensearchserverless
-- organizations
-- osis
-- outposts
-- panorama
-- partnercentral-account
-- partnercentral-benefits
-- partnercentral-channel
-- partnercentral-selling
-- pcs
-- personalize
-- personalize-events
-- personalize-runtime
-- pi
-- pinpoint
-- pipes
-- polly
-- proton
-- qbusiness
-- qconnect
-- quicksight
-- ram
-- rbin
-- rds
-- redshift
-- rekognition
-- repostspace
-- resiliencehub
-- resource-explorer-2
-- resource-groups
-- rolesanywhere
-- route53
-- route53-recovery-cluster
-- route53-recovery-control-config
-- route53-recovery-readiness
-- route53domains
-- route53globalresolver
-- route53profiles
-- route53resolver
-- rtbfabric
-- rum
-- runtime.sagemaker
-- s3
-- s3tables
-- s3vectors
-- savingsplans
-- scheduler
-- schemas
-- secretsmanager
-- securityhub
-- securitylake
-- serverlessrepo
-- servicecatalog
-- servicecatalog-appregistry
-- servicediscovery
-- shield
-- signer
-- signin
-- simspaceweaver
-- sms-voice
-- snowball
-- sns
-- sqs
-- ssm
-- ssm-contacts
-- ssm-sap
-- sso
-- storagegateway
-- sts
-- support
-- swf
-- synthetics
-- taxsettings
-- textract
-- tnb
-- transcribe
-- transfer
-- translate
-- trustedadvisor
-- verifiedpermissions
-- waf
-- waf-regional
-- wafv2
-- wellarchitected
-- wisdom
-- workdocs
-- workmail
-- workmailmessageflow
-- workspaces
-- workspaces-web
-- xray
+### 2. `aws.getOperationSchema`
+**Purpose**: Get the strict JSON Schema for a specific operation.
+*   **Input**: `{"service": "s3", "operation": "ListBuckets"}`
+*   **Output**: Full parameter definition, including required fields and type constraints.
 
-</details>
+### 3. `aws.execute`
+**Purpose**: The single entry point for validation and execution.
+*   **Action `validate`**: checks permissions and strict parameter validity without making network calls.
+*   **Action `invoke`**: performs the actual AWS API call.
+
+### Typical Workflow Example
+
+**User**: "Listing my S3 buckets."
+
+1.  **Search**: Agent calls `aws.searchOperations(query="list buckets")`.
+    *   *Result*: Finds `s3:ListBuckets`.
+2.  **Schema**: Agent calls `aws.getOperationSchema(service="s3", operation="ListBuckets")`.
+    *   *Result*: Receives schema showing optional parameters like `BucketRegion`.
+3.  **Execute**: Agent calls `aws.execute(action="invoke", service="s3", operation="ListBuckets", payload={})`.
+    *   *Result*: Returns the list of buckets.
+
+---
+
+## 🔐 Security & Policy
+
+This server is designed with a **"Defense in Depth"** approach.
+
+### 1. Policy Configuration (`policy.yaml`)
+You explicitly define what is allowed. By default, the policy should be restrictive.
+
+```yaml
+services:
+  allowlist:
+    - s3
+    - lambda
+    - ec2
+  denylist:
+    - iam # Explicitly block sensitive services
+
+rules:
+  allow:
+    - "^s3:List.*"    # Allow listing
+    - "^s3:Get.*"     # Allow reading
+  deny:
+    - "^.*:Delete.*"  # Global deny on deletion (overrides allow)
+
+destructive_patterns:
+  - "Delete"
+  - "Terminate"
+```
+
+### 2. Destructive Operation Protection
+If an operation matches a `destructive_pattern` (e.g., `DeleteBucket`) and is NOT in the `rules.deny` list, the server will **pause execution**.
+
+1.  The server returns a `ConfirmationRequired` error with a unique **Confirmation Token**.
+2.  The User must explicitly approve the action.
+3.  The Agent must re-submit the request with `{"options": {"confirmationToken": "..."}}`.
+
+---
+
+## � Advanced: Local File Integration
+
+The server supports a special `$path` syntax to handle local files securely, solving the problem of passing large binaries to LLMs.
+
+### uploading a File
+To upload a local file to S3 or use it in a Lambda function:
+
+```json
+{
+  "service": "s3",
+  "operation": "PutObject",
+  "payload": {
+    "Bucket": "my-bucket",
+    "Key": "images/photo.png",
+    "Body": { "$path": "/Users/me/Desktop/photo.png" }
+  }
+}
+```
+
+### Uploading a Folder
+The server automatically handles folder uploads (recursive S3 put or zipping for Lambda):
+
+```json
+{
+  "service": "lambda",
+  "operation": "CreateFunction",
+  "payload": {
+    "FunctionName": "my-api",
+    "Code": { "ZipFile": { "$path": "/Users/me/projects/my-api" } }
+  }
+}
+```
+
+---
+
+## ⚙️ Configuration
+
+Create a `.env` file in the root directory.
+
+| Variable | Required | Description | Default |
+| :--- | :---: | :--- | :--- |
+| `AWS_PROFILE` | No | AWS CLI profile to use | `default` |
+| `AWS_REGION` | No | Default AWS region | `us-east-1` |
+| `LOG_LEVEL` | No | `DEBUG`, `INFO`, `WARNING` | `INFO` |
+| `SMITHY_AUTO_SYNC` | No | Auto-update AWS models on startup | `true` |
+| `AWS_MCP_AUTO_APPROVE_DESTRUCTIVE` | No | **DANGER**: Skip confirmation prompts | `false` |
+
+---
+
+## ❓ Troubleshooting
+
+**Q: "Operation not found" error?**
+A: Ensure the service is in your `policy.yaml` allowlist. If strict mode is on, unrecognized services are hidden.
+
+**Q: "Access Denied" from AWS?**
+A: Trace the error:
+1.  Check `policy.yaml`: Did the MCP server block it?
+2.  Check AWS IAM: Does your `AWS_PROFILE` user have permission?
+
+**Q: Models are out of date?**
+A: Set `SMITHY_AUTO_SYNC=true` in `.env` and restart. The server will pull the latest definitions from AWS.
+
+---
+
+## 🏗 Development
+
+### Architecture
+*   **`src/aws_cli_mcp/policy`**: Policy engine logic.
+*   **`src/aws_cli_mcp/smithy`**: AWS model parsing and schema generation.
+*   **`src/aws_cli_mcp/execution`**: Request handling and audit logging.
+
+### Testing
+Run the test suite:
+```bash
+pytest tests/
+```
+
+---
+
+## 📜 License
+MIT

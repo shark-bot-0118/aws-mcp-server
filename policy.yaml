@@ -1,11 +1,5 @@
 version: 1
 
-defaults:
-  deny_destructive: true
-  require_approval_for_destructive: true
-  require_approval_for_risk:
-    - high
-
 services:
   allowlist:
     - ec2
@@ -25,6 +19,7 @@ services:
   denylist: []
 
 rules:
+  # Explicit allow rules (regex)
   allow:
     - "^sts:GetCallerIdentity$"
     - "^ec2:Describe.*$"
@@ -93,7 +88,7 @@ rules:
     - "^ec2:DeleteVolume$"
     - "^ec2:AttachVolume$"
     - "^ec2:DetachVolume$"
-  deny:
+  deny: []
 
 destructive_patterns:
   - "Delete"
@@ -101,20 +96,6 @@ destructive_patterns:
   - "Destroy"
   - "Stop"
   - "Detach"
-
-risk_patterns:
-  high:
-    - "Delete"
-    - "Terminate"
-    - "Destroy"
-    - "Detach"
-  medium:
-    - "Update"
-    - "Modify"
-
-# required_tags:
-#   - key: "Owner"
-#     pattern: ".+"
 
 approval:
   ttl_seconds: 3600
