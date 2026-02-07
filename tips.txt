@@ -1,6 +1,6 @@
 # AWS MCP ツール実行例まとめ (成功例)
 
-これまでの試行で成功した、AWS CLI MCP サーバーの `aws_execute` ツールを用いた実行例です。
+これまでの試行で成功した、AWS CLI MCP サーバーの `aws.execute` ツールを用いた実行例です。
 
 ## 1. Lambda 関数のリスト取得
 ```json

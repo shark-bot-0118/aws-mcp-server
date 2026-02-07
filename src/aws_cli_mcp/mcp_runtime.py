@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from pydantic import BaseModel
 
@@ -15,11 +16,11 @@ class ToolSpec:
     name: str
     description: str
     input_schema: dict[str, object]
-    handler: Callable[[dict[str, object]], "ToolResult"]
+    handler: Callable[[dict[str, object]], "ToolResult | Awaitable[ToolResult]"]
 
 
 class ToolResult(BaseModel):
-    content: str
+    content: list[dict[str, object]]
     structured_content: dict[str, object] | None = None
 
 
@@ -73,6 +74,10 @@ class _SimpleMCPServer:
                     continue
                 try:
                     result = self._tools[name].handler(arguments)
+                    if _is_awaitable(result):
+                        import asyncio
+
+                        result = asyncio.run(result)
                 except Exception as exc:  # pragma: no cover - error path
                     self._write_error(request_id, str(exc))
                     continue
@@ -136,25 +141,28 @@ class MCPServer:
         if FunctionTool is None or FastToolResult is None:
             raise RuntimeError("FastMCP tooling unavailable")
 
-        # Create a dynamic handler with implicit arguments matching the schema
-        # FastMCP does not support **kwargs, so we must generate a function with specific args.
+        # Build a closure-based handler with a synthetic signature so FastMCP
+        # sees named parameters without resorting to exec()/eval().
         prop_names = list(tool.input_schema.get("properties", {}).keys())
-        args_str = ", ".join(f"{name}: object = None" for name in prop_names)
-        
-        # We need a unique name for the function to avoid conflicts if we were caching, 
-        # though here it's local scope so it's fine.
-        func_name = f"_dynamic_handler_{tool.name.replace('-', '_')}"
-        
-        code = f"""
-async def {func_name}({args_str}) -> FastToolResult:
-    args = locals()
-    kwargs = {{k: v for k, v in args.items() if v is not None}}
-    result = tool.handler(kwargs)
-    return FastToolResult(content=result.content, structured_content=result.structured_content)
-"""
-        local_scope = {"tool": tool, "FastToolResult": FastToolResult}
-        exec(code, local_scope)
-        _handler = local_scope[func_name]
+
+        async def _handler(**kwargs: object) -> "FastToolResult":
+            filtered = {k: v for k, v in kwargs.items() if v is not None}
+            result = tool.handler(filtered)
+            if _is_awaitable(result):
+                result = await result
+            return FastToolResult(
+                content=result.content,
+                structured_content=result.structured_content,
+            )
+
+        # Attach a synthetic signature so FastMCP discovers the named parameters.
+        params = [
+            inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=object)
+            for name in prop_names
+        ]
+        _handler.__signature__ = inspect.Signature(params)  # type: ignore[attr-defined]
+        safe_name = tool.name.replace("-", "_").replace(".", "_")
+        _handler.__name__ = f"_handler_{safe_name}"
 
         fast_tool = FunctionTool.from_function(
             _handler,
@@ -166,3 +174,12 @@ async def {func_name}({args_str}) -> FastToolResult:
         if isinstance(fields, dict) and "input_schema" in fields:
             fast_tool.input_schema = tool.input_schema
         self._server.add_tool(fast_tool)
+
+
+def _is_awaitable(value: object) -> bool:
+    try:
+        import inspect
+
+        return inspect.isawaitable(value)
+    except Exception:
+        return False

@@ -19,31 +19,19 @@ from aws_cli_mcp.tools.aws_unified import (
 from aws_cli_mcp.smithy.parser import SmithyModel, StructureShape, Member, StringShape, Shape, UnionShape
 from aws_cli_mcp.domain.operations import OperationRef
 
-def test_is_exposed_allowlists():
+def test_is_exposed_policy_only():
     ctx = MagicMock()
+    op_ref = OperationRef("s3", "ListBuckets")
+
     ctx.policy_engine.is_service_allowed.return_value = True
     ctx.policy_engine.is_operation_allowed.return_value = True
-    
-    op_ref = OperationRef("s3", "ListBuckets")
-    
-    # Empty lists (default allow)
-    ctx.settings.smithy.allowlist_services = []
-    ctx.settings.smithy.allowlist_operations = []
     assert _is_exposed(ctx, op_ref) is True
-    
-    # Service allowlist
-    ctx.settings.smithy.allowlist_services = ["s3"]
-    assert _is_exposed(ctx, op_ref) is True
-    
-    ctx.settings.smithy.allowlist_services = ["ec2"]
+
+    ctx.policy_engine.is_service_allowed.return_value = False
     assert _is_exposed(ctx, op_ref) is False
-    
-    # Operation allowlist
-    ctx.settings.smithy.allowlist_services = []
-    ctx.settings.smithy.allowlist_operations = ["s3:ListBuckets"]
-    assert _is_exposed(ctx, op_ref) is True
-    
-    ctx.settings.smithy.allowlist_operations = ["s3:GetObject"]
+
+    ctx.policy_engine.is_service_allowed.return_value = True
+    ctx.policy_engine.is_operation_allowed.return_value = False
     assert _is_exposed(ctx, op_ref) is False
 
 def test_coerce_timestamp():
@@ -188,14 +176,14 @@ def test_coercion_missing_branches():
     # Integer from Bool
     with pytest.raises(ValueError, match="Expected integer.*got boolean"):
         _coerce_integer(True, "path", "integer")
-        
+
     # Integer from bad String
     with pytest.raises(ValueError, match="Cannot convert"):
          _coerce_integer("invalid", "path", "integer")
-    
+
     # Coerce Blob invalid type
     with pytest.raises(ValueError, match="Expected base64 string or bytes"):
-        _coerce_blob(123, "path")
+        _coerce_blob(123, "path")  # Now only accepts bytes or string
         
     # Coerce Float
     assert _coerce_float("1.5", "") == 1.5
@@ -226,46 +214,6 @@ def test_coerce_union():
     # Invalid (multiple)
     with pytest.raises(ValueError, match="requires exactly one member"):
         _coerce_payload_types(model, "union", {"A": "1", "B": "2"})
-
-def test_read_streaming_fields_coverage():
-    from aws_cli_mcp.tools.aws_unified import _read_streaming_fields
-
-    
-    # 1. Exception during read
-    mock_body = MagicMock()
-    mock_body.read.side_effect = Exception("Read error")
-    response = {"Body": mock_body}
-    _read_streaming_fields(response)
-    assert response["Body"] == ""
-    
-    # 2. Bytes content (UTF-8)
-    mock_body.read.side_effect = None
-    mock_body.read.return_value = b"hello"
-    response = {"Body": mock_body}
-    _read_streaming_fields(response)
-    assert response["Body"] == "hello"
-    
-    # 3. Bytes content (Binary -> Base64)
-    # Mocking read such that subsequent calls return binary?
-    # Actually need a fresh mock or reset
-    mock_body = MagicMock()
-    mock_body.read.return_value = b"\xff\xff" # Invalid UTF-8
-    response = {"Body": mock_body}
-    _read_streaming_fields(response)
-    # base64.b64encode(b'\xff\xff') -> b'//8='
-    assert response["Body"] == "//8="
-    
-    # 4. String content / Empty
-    mock_body = MagicMock()
-    mock_body.read.return_value = None
-    response = {"Body": mock_body}
-    _read_streaming_fields(response)
-    assert response["Body"] == ""
-    
-    # 5. Not readable
-    response = {"Body": "already_string"}
-    _read_streaming_fields(response)
-    assert response["Body"] == "already_string"
 
 def test_truncate_json():
     from aws_cli_mcp.tools.aws_unified import _truncate_json
@@ -303,37 +251,58 @@ def test_redact():
     assert redacted["list"][1] == "visible"
     assert "visible" == _redact("visible")
 
-def test_retry_break():
+@pytest.mark.asyncio
+async def test_retry_break():
     # Directly test the retry loop logic by mocking _call_boto3 to raise exception
     # This effectively happens in execute_operation, but we need to ensure max_retries break is hit
     
-
     from botocore.exceptions import BotoCoreError
     
     with patch("aws_cli_mcp.tools.aws_unified._call_boto3") as mock_call:
-        with patch("time.sleep"):
+        with patch("asyncio.sleep"):
             mock_call.side_effect = BotoCoreError(error_code="Throttling", msg="Throttle")
             
             ctx = MagicMock()
             ctx.settings.execution.max_retries = 1 # Correct attribute
-            # Ensure it retries a few times then breaks
-        # Ensure it retries a few times then breaks
-        # But we need to control ctx.settings or constants?
-        # execute_operation has max_retries=3 hardcoded or from somewhere?
-        # "for attempt in range(max_retries + 1):" where max_retries=3
-        
-        # We need validation to pass first
-        with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
-             with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx):
-                 ctx.policy_engine.evaluate.return_value.allowed = True
-                 ctx.settings.server.auto_approve_destructive = True
-                 ctx.catalog.find_operation.return_value = MagicMock(op_ref=MagicMock(service="s", operation="o"))
-                 
-                 result = execute_operation({
-                     "action": "invoke", "service": "s", "operation": "o", "payload": {}
-                 })
-                 
-                 # It should fail with ExecutionError
-                 assert "ExecutionError" in str(result)
-                 # Should have called multiple times
-                 assert mock_call.call_count > 1
+            ctx.settings.server.transport_mode = "stdio"
+            ctx.store.update_op_status = MagicMock()
+            ctx.store.update_tx_status = MagicMock()
+            
+            # We need validation to pass first
+            with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+                 with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx):
+                     # Mock policy
+                     mock_decision = MagicMock()
+                     mock_decision.allowed = True
+                     mock_decision.require_approval = False
+                     ctx.policy_engine.evaluate.return_value = mock_decision
+                     ctx.policy_engine.is_service_allowed.return_value = True
+                     ctx.policy_engine.is_operation_allowed.return_value = True
+                     
+                     ctx.settings.server.auto_approve_destructive = True
+                     
+                     # Mock catalog
+                     mock_entry = MagicMock()
+                     mock_entry.operation_shape_id = "op-id"
+                     ctx.catalog.find_operation.return_value = mock_entry
+                     
+                     # Mock _resolve_snapshot
+                     with patch("aws_cli_mcp.tools.aws_unified._resolve_snapshot") as mock_resolve:
+                         mock_snapshot = MagicMock()
+                         mock_snapshot.catalog = ctx.catalog
+                         mock_snapshot.model = MagicMock()
+                         mock_resolve.return_value = (mock_snapshot, "v1")
+                         
+                         # Mock coerce
+                         with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
+                             # Mock inject
+                             with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
+                             
+                                 result = await execute_operation({
+                                     "action": "invoke", "service": "s", "operation": "o", "payload": {}
+                                 })
+                                 
+                                 # It should fail with ExecutionError
+                                 assert "ExecutionError" in str(result)
+                                 # Should have called multiple times
+                                 assert mock_call.call_count > 1

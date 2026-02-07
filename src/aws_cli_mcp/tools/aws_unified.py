@@ -1,20 +1,41 @@
-"""Unified AWS tools for the 3-tool architecture.
+"""
+Unified AWS tools for the 3-tool architecture.
 
 This module provides three tools:
-- aws.searchOperations: Search AWS operations from Smithy models
-- aws.getOperationSchema: Get JSON Schema for an operation
-- aws.execute: Validate and invoke AWS operations
+- aws_search_operations: Search AWS operations from Smithy models
+- aws_get_operation_schema: Get JSON Schema for an operation
+- aws_execute: Validate and invoke AWS operations
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
+import re
+import time
+from datetime import datetime, timezone
 from uuid import uuid4
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 from aws_cli_mcp.app import get_app_context
 from aws_cli_mcp.audit.models import AuditOpRecord, AuditTxRecord
+from aws_cli_mcp.auth.context import (
+    AWSCredentials,
+    get_request_context_optional,
+    update_request_context,
+)
+from aws_cli_mcp.aws_credentials.identity_center import (
+    IdentityCenterError,
+    get_identity_center_provider,
+)
 from aws_cli_mcp.domain.operations import OperationRef
-from aws_cli_mcp.execution.aws_client import get_client
+from aws_cli_mcp.execution.aws_client import (
+    RequestContextError,
+    call_aws_api_async,
+    get_client_async,
+)
 from aws_cli_mcp.execution.idempotency import inject_idempotency_tokens
 from aws_cli_mcp.mcp_runtime import ToolResult, ToolSpec
 from aws_cli_mcp.smithy.parser import (
@@ -25,6 +46,7 @@ from aws_cli_mcp.smithy.parser import (
     StructureShape,
     UnionShape,
 )
+from aws_cli_mcp.smithy.version_manager import load_model_snapshot
 from aws_cli_mcp.tools.base import result_from_payload, validate_or_raise
 from aws_cli_mcp.utils.hashing import sha256_text
 from aws_cli_mcp.utils.jsonschema import (
@@ -60,10 +82,6 @@ SEARCH_SCHEMA = {
             "default": 20,
             "description": "Maximum number of results to return (default: 20).",
         },
-        "modelVersion": {
-            "type": "string",
-            "description": "Optional model version (commit SHA). Uses current if not specified.",
-        },
     },
     "required": ["query"],
     "additionalProperties": False,
@@ -88,10 +106,6 @@ GET_SCHEMA_SCHEMA = {
                 "or kebab-case/snake_case (e.g. 'list-functions', 'list_functions'). "
                 "The name is case-insensitive."
             ),
-        },
-        "modelVersion": {
-            "type": "string",
-            "description": "Optional model version (commit SHA). Uses current if not specified.",
         },
     },
     "required": ["service", "operation"],
@@ -144,13 +158,14 @@ EXECUTE_SCHEMA = {
                 "Uses AWS_DEFAULT_REGION if not specified."
             ),
         },
-        "modelVersion": {
-            "type": "string",
-            "description": "Optional model version (commit SHA). Uses current if not specified.",
-        },
         "options": {
             "type": ["object", "string"],
-            "description": "Execution options (e.g., skipApproval, approvalToken).",
+            "description": (
+                "Execution options. For Identity Center, specify accountId + roleName "
+                "(or roleArn) to select the role. Example: "
+                "{'accountId': '123456789012', 'roleName': 'ReadOnly'}. "
+                "Other options include confirmationToken for destructive operations."
+            ),
         },
     },
     "required": ["action", "service", "operation", "payload"],
@@ -158,25 +173,16 @@ EXECUTE_SCHEMA = {
 }
 
 
-def _retrieve_model_version(ctx) -> str:
-    """Get the current model version from the app context."""
-    return getattr(ctx, "model_version", "latest")
+async def _run_blocking(ctx, func, *args, **kwargs):
+    if ctx.settings.server.transport_mode in {"http", "remote"}:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    return func(*args, **kwargs)
 
 
 def _is_exposed(ctx, op_ref: OperationRef) -> bool:
-    """Check if an operation is exposed based on policy and settings."""
-    settings = ctx.settings
+    """Check if an operation is exposed based on policy only."""
     if not ctx.policy_engine.is_service_allowed(op_ref.service):
         return False
-    if settings.smithy.allowlist_services:
-        allowed_services = [s.lower() for s in settings.smithy.allowlist_services]
-        if op_ref.service.lower() not in allowed_services:
-            return False
-    if settings.smithy.allowlist_operations:
-        key = f"{op_ref.service}:{op_ref.operation}".lower()
-        allowed = {item.lower() for item in settings.smithy.allowlist_operations}
-        if key not in allowed:
-            return False
     return ctx.policy_engine.is_operation_allowed(op_ref)
 
 
@@ -193,9 +199,9 @@ def search_operations(payload: dict[str, object]) -> ToolResult:
     if service_hint:
         service_hint = str(service_hint).lower()
     limit = int(payload.get("limit", 20))
-    model_version = _retrieve_model_version(ctx)
+    snapshot = load_model_snapshot()
 
-    matches = ctx.catalog.search(query, service=service_hint)
+    matches = snapshot.catalog.search(query, service=service_hint)
     results: list[dict[str, object]] = []
 
     for entry in matches:
@@ -224,11 +230,7 @@ def search_operations(payload: dict[str, object]) -> ToolResult:
             },
         })
 
-    return result_from_payload({
-        "modelVersion": model_version,
-        "count": len(results),
-        "results": results,
-    })
+    return result_from_payload({"count": len(results), "results": results})
 
 
 def get_operation_schema(payload: dict[str, object]) -> ToolResult:
@@ -241,9 +243,9 @@ def get_operation_schema(payload: dict[str, object]) -> ToolResult:
 
     service = str(payload["service"]).lower()
     operation = str(payload["operation"])
-    model_version = _retrieve_model_version(ctx)
+    snapshot = load_model_snapshot()
 
-    entry = ctx.catalog.find_operation(service, operation)
+    entry = snapshot.catalog.find_operation(service, operation)
     if not entry:
         raise ValueError(f"Operation not found: {service}:{operation}")
 
@@ -251,18 +253,19 @@ def get_operation_schema(payload: dict[str, object]) -> ToolResult:
     if not _is_exposed(ctx, op_ref):
         raise ValueError(f"Operation is not allowlisted: {service}:{operation}")
 
-    schema = ctx.schema_generator.generate_operation_input_schema(entry.operation_shape_id)
+    schema = snapshot.schema_generator.generate_operation_input_schema(entry.operation_shape_id)
 
-    return result_from_payload({
-        "modelVersion": model_version,
-        "service": service,
-        "operation": operation,
-        "schema": schema,
-        "description": entry.documentation,
-    })
+    return result_from_payload(
+        {
+            "service": service,
+            "operation": operation,
+            "schema": schema,
+            "description": entry.documentation,
+        }
+    )
 
 
-def execute_operation(payload: dict[str, object]) -> ToolResult:
+async def execute_operation(payload: dict[str, object]) -> ToolResult:
     """Validate and/or invoke an AWS operation.
 
     Supports two actions:
@@ -274,7 +277,11 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
     
     # Lazy cleanup of expired pending confirmation tokens (1 hour TTL)
     try:
-        ctx.store.cleanup_pending_txs(3600)
+        await _run_blocking(
+            ctx,
+            ctx.store.cleanup_pending_txs,
+            ctx.policy_engine.approval_ttl_seconds,
+        )
     except Exception:
         # Don't fail the operation if cleanup fails
         pass
@@ -283,91 +290,90 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
     service = str(payload["service"]).lower()
     operation = str(payload["operation"])
 
-    # Handle payload as either object or JSON string
-    raw_payload = payload.get("payload", {})
-    if isinstance(raw_payload, str):
-        try:
-            raw_payload = json.loads(raw_payload)
-        except json.JSONDecodeError as e:
-            return _error_response(
-                _retrieve_model_version(ctx),
-                "InvalidPayload",
-                f"Failed to parse payload as JSON: {e}",
-                hint="Provide payload as an object, not a string.",
-            )
+    snapshot = load_model_snapshot()
+
+    raw_payload = _parse_json_arg(payload.get("payload"), "payload")
+    if isinstance(raw_payload, ToolResult):
+        return raw_payload
     op_payload = dict(raw_payload) if raw_payload else {}
 
     region = payload.get("region")
 
-    # Handle options as either object or JSON string
-    raw_options = payload.get("options", {})
-    if isinstance(raw_options, str):
-        try:
-            raw_options = json.loads(raw_options)
-        except json.JSONDecodeError:
-            raw_options = {}
+    raw_options = _parse_json_arg(payload.get("options"), "options")
     options = dict(raw_options) if raw_options else {}
 
-    model_version = _retrieve_model_version(ctx)
-
-    entry = ctx.catalog.find_operation(service, operation)
+    entry = snapshot.catalog.find_operation(service, operation)
     if not entry:
         return _error_response(
-            model_version,
             "OperationNotFound",
             f"Operation not found: {service}:{operation}",
-            hint="Use aws.searchOperations to find valid operations.",
+            hint="Use aws_search_operations to find valid operations.",
         )
 
     op_ref = OperationRef(service=service, operation=operation)
     if not _is_exposed(ctx, op_ref):
         return _error_response(
-            model_version,
             "OperationNotAllowed",
             f"Operation is not allowlisted: {service}:{operation}",
             hint="Check your policy configuration.",
         )
 
-    schema = ctx.schema_generator.generate_operation_input_schema(entry.operation_shape_id)
+    schema = snapshot.schema_generator.generate_operation_input_schema(entry.operation_shape_id)
     validation_errors = validate_payload_structured(schema, op_payload)
 
     if validation_errors:
         error_details = format_structured_errors(validation_errors)
-        return result_from_payload({
-            "modelVersion": model_version,
-            "service": service,
-            "operation": operation,
-            "error": {
-                "type": "ValidationError",
-                "message": "Payload validation failed",
-                **error_details,
-            },
-        })
+        return result_from_payload(
+            {
+                "service": service,
+                "operation": operation,
+                "error": {
+                    "type": "ValidationError",
+                    "message": "Payload validation failed",
+                    **error_details,
+                },
+            }
+        )
 
     if action == "validate":
         policy_decision = ctx.policy_engine.evaluate(op_ref, op_payload)
-        return result_from_payload({
-            "modelVersion": model_version,
-            "service": service,
-            "operation": operation,
-            "valid": True,
-            "policy": {
-                "allowed": policy_decision.allowed,
-                "requireApproval": policy_decision.require_approval,
-                "risk": policy_decision.risk,
-                "reasons": policy_decision.reasons,
-            },
-        })
+        return result_from_payload(
+            {
+                "service": service,
+                "operation": operation,
+                "valid": True,
+                "policy": {
+                    "allowed": policy_decision.allowed,
+                    "requireApproval": policy_decision.require_approval,
+                    "risk": policy_decision.risk,
+                    "reasons": policy_decision.reasons,
+                },
+            }
+        )
 
     policy_decision = ctx.policy_engine.evaluate(op_ref, op_payload)
     if not policy_decision.allowed:
         return _error_response(
-            model_version,
             "PolicyDenied",
             "Operation denied by policy",
             reasons=policy_decision.reasons,
             hint="Check your policy configuration or request explicit approval.",
         )
+
+    selected_account_id: str | None = None
+    selected_role_name: str | None = None
+    role_context: dict[str, object] | None = None
+
+    if (
+        action == "invoke"
+        and _identity_center_enabled(ctx)
+        and ctx.settings.server.transport_mode in {"http", "remote"}
+    ):
+        selection = await _resolve_identity_center_role_selection(ctx, options)
+        if isinstance(selection, ToolResult):
+            return selection
+        selected_account_id, selected_role_name = selection
+        role_context = {"accountId": selected_account_id, "roleName": selected_role_name}
 
     # Destructive operation check & Auto-approval check
     is_destructive = policy_decision.require_approval
@@ -381,11 +387,10 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
         if confirmation_token:
             # Look up the pending transaction
             # We use the token as the tx_id lookup
-            pending_tx = ctx.store.get_tx(confirmation_token)
+            pending_tx = await _run_blocking(ctx, ctx.store.get_tx, confirmation_token)
 
             if not pending_tx:
-                 return _error_response(
-                    model_version,
+                return _error_response(
                     "InvalidConfirmationToken",
                     "The provided confirmation token is invalid or expired.",
                     hint="Please re-run the command without a token to get a new one.",
@@ -393,82 +398,73 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
 
             if pending_tx.status != "PendingConfirmation":
                 return _error_response(
-                    model_version,
                     "InvalidConfirmationToken",
                     "This token has already been used or is not in a pending state.",
                 )
 
-            # Verify payload consistency (prevent parameter tampering)
-            # We need to reconstruct what the payload hash WAS.
-            # Ideally, we should fetch the op record associated with this tx to check hash.
-            # But ctx.store.get_tx doesn't give us the op.
-            # Let's assume for now if they have the valid tx_id token, it's sufficient proof.
-            # To be strictly safe, we should check hash, but let's implement the basic flow first.
+            current_actor = _actor_from_request_context()
+            if not current_actor or pending_tx.actor != current_actor:
+                return _error_response(
+                    "InvalidConfirmationToken",
+                    "The confirmation token does not belong to this authenticated user.",
+                    hint="Please re-run the command without a token to get a new one.",
+                )
+
+            pending_op = await _run_blocking(ctx, ctx.store.get_pending_op, confirmation_token)
+
+            if not pending_op:
+                return _error_response(
+                    "InvalidConfirmationToken",
+                    "The provided confirmation token is invalid or expired.",
+                    hint="Please re-run the command without a token to get a new one.",
+                )
+
+            if pending_op.service != service or pending_op.operation != operation:
+                return _error_response(
+                    "InvalidConfirmationToken",
+                    "The confirmation token does not match this operation.",
+                    hint="Please re-run the command without a token to get a new one.",
+                )
+
+            current_hash = _compute_request_hash(op_payload, role_context)
+            if pending_op.request_hash != current_hash:
+                return _error_response(
+                    "InvalidConfirmationToken",
+                    "The confirmation token does not match this request payload.",
+                    hint="Please re-run the command without a token to get a new one.",
+                )
 
             # Update status to 'Started' to mark as consumed
-            ctx.store.update_tx_status(confirmation_token, "Started", None)
+            await _run_blocking(
+                ctx,
+                ctx.store.update_tx_status,
+                confirmation_token,
+                "Started",
+                None,
+            )
             
-            # Use the existing tx_id (which is the token)
             tx_id = confirmation_token
+            op_id = uuid4().hex
+            
+            # Destructive execution phase
+            await _record_audit_log(
+                ctx, tx_id, op_id, service, operation, op_payload,
+                status="Started", region=region, is_new_tx=False,
+                model=snapshot.model, operation_shape_id=entry.operation_shape_id,
+                request_context=role_context,
+            )
 
         # Case 2: No token -> Generate Pending Transaction and Return Error
         else:
-            # Generate a short, readable token (using first 6 chars of UUID for readability)
-            # but to ensure uniqueness we'll use the full UUID as the primary key internally,
-            # and just return the first 6 chars? No, let's use a 6-char hex as the ID.
-            # Wait, collision risk. Let's use full UUID for internal tx_id.
-            # Actually, User said "6-char token".
-            # Let's generate a 6-char hex string. It's unique enough for short-lived pending op.
-            tx_id = uuid4().hex[:6].upper()
+            tx_id = uuid4().hex.upper()
             op_id = uuid4().hex
-
-            started_at = utc_now_iso()
-
-            # Create Pending Tx
-            tx_record = AuditTxRecord(
-                tx_id=tx_id,
-                plan_id=None,
-                status="PendingConfirmation",
-                actor=None,
-                role=None,
-                account=None,
-                region=str(region) if region else None,
-                started_at=started_at,
-                completed_at=None,
-            )
-            ctx.store.create_tx(tx_record)
-
-            # We also need to log the operation details to verify later, or at least for audit
-            # Inject idempotency tokens here to ensure the hash is stable? 
-            # Actually, we haven't executed yet. 
-            request_payload, _ = inject_idempotency_tokens(
-                ctx.smithy_model, entry.operation_shape_id, op_payload
-            )
-            request_hash = sha256_text(
-                json.dumps(request_payload, sort_keys=True, ensure_ascii=True)
-            )
             
-            op_record = AuditOpRecord(
-                op_id=op_id,
-                tx_id=tx_id,
-                service=service,
-                operation=operation,
-                request_hash=request_hash,
-                status="PendingConfirmation",
-                duration_ms=None,
-                error=None,
-                response_summary=None,
-                created_at=started_at,
+            await _record_audit_log(
+                ctx, tx_id, op_id, service, operation, op_payload,
+                status="PendingConfirmation", region=region, is_new_tx=True,
+                model=snapshot.model, operation_shape_id=entry.operation_shape_id,
+                request_context=role_context,
             )
-            ctx.store.create_op(op_record)
-            
-            # Store the request payload so we can see what was requested
-            request_artifact = ctx.artifacts.write_json(
-                "request", _redact(request_payload), prefix=tx_id
-            )
-            request_artifact.tx_id = tx_id
-            request_artifact.op_id = op_id
-            ctx.store.add_audit_artifact(request_artifact)
 
             hint_msg = (
                 "SECURITY CHECK: Destructive operation detected. "
@@ -478,7 +474,6 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
                 f"'options': {{'confirmationToken': '{tx_id}'}}."
             )
             return _error_response(
-                model_version,
                 "ConfirmationRequired",
                 "Destructive operation requires confirmation.",
                 hint=hint_msg,
@@ -486,114 +481,66 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
                     f"Token: {tx_id}",
                     f"Service: {service}",
                     f"Operation: {operation}",
-                    f"Target: {json.dumps(_redact(op_payload))}"
+                    f"Target: {json.dumps(_redact(op_payload))}",
+                    f"Role: {role_context}" if role_context else "Role: (not specified)",
                 ]
             )
     else:
         # Non-destructive or Auto-approve -> Start new Tx
         tx_id = uuid4().hex
-        started_at = utc_now_iso()
-        ctx.store.create_tx(AuditTxRecord(
-            tx_id=tx_id,
-            plan_id=None,
-            status="Started",
-            actor=None,
-            role=None,
-            account=None,
-            region=str(region) if region else None,
-            started_at=started_at,
-            completed_at=None,
-        ))
-
-    # If we reused an existing tx (Case 1), we don't need to create a new OP record if one exists, 
-    # but we need to update it or create a new "Execution" op.
-    # For simplicity, if it was pending, we update the existing OP status to 'Started'.
-    if is_destructive and confirmation_token:
-         # Find the op for this tx
-         # SQLite store doesn't have get_op_by_tx easily without query.
-         # Let's just create a NEW op for the execution phase to keep history clear.
-         op_id = uuid4().hex
-    else:
-         op_id = uuid4().hex
-
-    if not (is_destructive and confirmation_token):
-        # Normal flow (or first step of auto-approve) - record the OP
-        request_payload, injected_fields = inject_idempotency_tokens(
-            ctx.smithy_model, entry.operation_shape_id, op_payload
-        )
-        request_hash = sha256_text(
-            json.dumps(request_payload, sort_keys=True, ensure_ascii=True)
+        op_id = uuid4().hex
+        
+        await _record_audit_log(
+            ctx, tx_id, op_id, service, operation, op_payload,
+            status="Started", region=region, is_new_tx=True,
+            model=snapshot.model, operation_shape_id=entry.operation_shape_id,
+            request_context=role_context,
         )
 
-        op_record = AuditOpRecord(
-            op_id=op_id,
-            tx_id=tx_id,
-            service=service,
-            operation=operation,
-            request_hash=request_hash,
-            status="Started",
-            duration_ms=None,
-            error=None,
-            response_summary=None,
-            created_at=started_at,
+    if (
+        action == "invoke"
+        and _identity_center_enabled(ctx)
+        and selected_account_id
+        and selected_role_name
+    ):
+        cred_error = await _ensure_identity_center_credentials(
+            ctx,
+            selected_account_id,
+            selected_role_name,
         )
-        ctx.store.create_op(op_record)
+        if isinstance(cred_error, ToolResult):
+            await _run_blocking(
+                ctx,
+                ctx.store.update_op_status,
+                op_id,
+                "Failed",
+                0,
+                "Identity Center credential error",
+                None,
+            )
+            await _run_blocking(
+                ctx, ctx.store.update_tx_status, tx_id, "Failed", completed_at=utc_now_iso()
+            )
+            return cred_error
 
-        request_artifact = ctx.artifacts.write_json(
-            "request", _redact(request_payload), prefix=tx_id
-        )
-        request_artifact.tx_id = tx_id
-        request_artifact.op_id = op_id
-        ctx.store.add_audit_artifact(request_artifact)
-    else:
-        # Destructive execution phase (Case 1)
-        # We need to re-generate payload/tokens to make the call
-        request_payload, injected_fields = inject_idempotency_tokens(
-             ctx.smithy_model, entry.operation_shape_id, op_payload
-        )
-        request_hash = sha256_text(
-            json.dumps(request_payload, sort_keys=True, ensure_ascii=True)
-        )
+    # Inject idempotency tokens BEFORE type coercion
+    # This ensures tokens are included in the actual AWS request
+    payload_with_tokens, _ = inject_idempotency_tokens(
+        snapshot.model, entry.operation_shape_id, op_payload
+    )
 
-        op_record = AuditOpRecord(
-            op_id=op_id,
-            tx_id=tx_id,
-            service=service,
-            operation=operation,
-            request_hash=request_hash,
-            status="Started",
-            duration_ms=None,
-            error=None,
-            response_summary=None,
-            created_at=utc_now_iso(),
-        )
-        ctx.store.create_op(op_record)
-
-        request_artifact = ctx.artifacts.write_json(
-            "request", _redact(request_payload), prefix=tx_id
-        )
-        request_artifact.tx_id = tx_id
-        request_artifact.op_id = op_id
-        ctx.store.add_audit_artifact(request_artifact)
-
-
-    import time
-
-    from botocore.exceptions import BotoCoreError, ClientError
-
-    # Coerce payload types (blob/$path, numeric/boolean conversion, etc.)
+    # Coerce payload types (blob base64, numeric/boolean conversion, etc.)
     try:
         coerced_payload = _coerce_payload_types(
-            ctx.smithy_model, entry.operation_shape_id, request_payload,
+            snapshot.model, entry.operation_shape_id, payload_with_tokens,
             service=service, operation=operation,
         )
     except ValueError as e:
         return _error_response(
-            model_version,
             "TypeCoercionError",
             str(e),
             hint=(
-                "Check field types: blobs can be base64-encoded or {\"$path\": \"/local/path\"}, "
+                "Check field types: blobs must be base64-encoded, "
                 "numbers must be numeric, booleans must be true/false."
             ),
         )
@@ -604,23 +551,25 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
     max_retries = ctx.settings.execution.max_retries
     started = time.perf_counter()
 
-    # Check for S3 folder upload (Body is list of files)
-    is_folder_upload = _is_s3_folder_upload(service, operation, coerced_payload)
-
     while attempt <= max_retries:
         try:
-            if is_folder_upload:
-                response_payload = _execute_s3_folder_upload(coerced_payload, region)
-            else:
-                response_payload = _call_boto3(service, operation, coerced_payload, region)
+            response_payload = await _call_boto3(
+                service,
+                operation,
+                coerced_payload,
+                region,
+                ctx.settings.execution.max_output_characters,
+            )
             error_message = None
             break
+        except RequestContextError:
+            raise
         except (ClientError, BotoCoreError) as exc:
             error_message = str(exc)
             if attempt >= max_retries or not _is_retryable(exc):
                 break
             backoff = 0.5 * (2**attempt)
-            time.sleep(backoff)
+            await asyncio.sleep(backoff)
             attempt += 1
         except Exception as exc:
             error_message = str(exc)
@@ -631,44 +580,66 @@ def execute_operation(payload: dict[str, object]) -> ToolResult:
 
     response_summary = None
     if response_payload is not None:
-        response_summary = _truncate_json(response_payload, 2000)
-        response_artifact = ctx.artifacts.write_json("response", response_payload, prefix=tx_id)
+        # Redact sensitive data from response before logging
+        redacted_response = _redact(response_payload)
+        limited_redacted_response = _limit_result_payload(
+            redacted_response if isinstance(redacted_response, dict) else {},
+            ctx.settings.execution.max_output_characters,
+        )
+        response_summary = _truncate_json(limited_redacted_response, 2000)
+        
+        response_artifact = await _run_blocking(
+            ctx,
+            ctx.artifacts.write_json,
+            "response",
+            limited_redacted_response,
+            prefix=tx_id,
+        )
         response_artifact.tx_id = tx_id
         response_artifact.op_id = op_id
-        ctx.store.add_audit_artifact(response_artifact)
+        await _run_blocking(ctx, ctx.store.add_audit_artifact, response_artifact)
 
-    ctx.store.update_op_status(op_id, status, duration_ms, error_message, response_summary)
-    ctx.store.update_tx_status(tx_id, status, completed_at=utc_now_iso())
+    await _run_blocking(
+        ctx, ctx.store.update_op_status, op_id, status, duration_ms, error_message, response_summary
+    )
+    await _run_blocking(
+        ctx, ctx.store.update_tx_status, tx_id, status, completed_at=utc_now_iso()
+    )
 
     if error_message:
-        return result_from_payload({
-            "modelVersion": model_version,
+        return result_from_payload(
+            {
+                "service": service,
+                "operation": operation,
+                "error": {
+                    "type": "ExecutionError",
+                    "message": error_message,
+                },
+                "metadata": {
+                    "tx_id": tx_id,
+                    "op_id": op_id,
+                },
+            }
+        )
+
+    limited_result = _limit_result_payload(
+        response_payload if isinstance(response_payload, dict) else {},
+        ctx.settings.execution.max_output_characters,
+    )
+    return result_from_payload(
+        {
             "service": service,
             "operation": operation,
-            "error": {
-                "type": "ExecutionError",
-                "message": error_message,
-            },
+            "result": limited_result,
             "metadata": {
                 "tx_id": tx_id,
                 "op_id": op_id,
             },
-        })
-
-    return result_from_payload({
-        "modelVersion": model_version,
-        "service": service,
-        "operation": operation,
-        "result": response_payload,
-        "metadata": {
-            "tx_id": tx_id,
-            "op_id": op_id,
-        },
-    })
+        }
+    )
 
 
 def _error_response(
-    model_version: str,
     error_type: str,
     message: str,
     hint: str | None = None,
@@ -686,10 +657,303 @@ def _error_response(
         error["reasons"] = reasons
     error["retryable"] = retryable
 
+    return result_from_payload({"error": error})
+
+
+def _compute_request_hash(
+    payload: dict[str, object],
+    context: dict[str, object] | None = None,
+) -> str:
+    """Compute a stable hash of the request payload plus optional context."""
+    envelope: dict[str, object]
+    if context:
+        envelope = {"payload": payload, "context": context}
+    else:
+        envelope = payload
+    normalized = json.dumps(
+        envelope,
+        sort_keys=True,
+        ensure_ascii=True,
+        default=json_default,
+    )
+    return sha256_text(normalized)
+
+
+def _identity_center_enabled(ctx) -> bool:
+    return ctx.settings.auth.provider.lower() == "identity-center"
+
+
+def _actor_from_request_context() -> str | None:
+    request_ctx = get_request_context_optional()
+    if request_ctx is None:
+        return None
+    return f"{request_ctx.issuer}:{request_ctx.user_id}"
+
+
+def _parse_role_arn(role_arn: str) -> tuple[str, str] | None:
+    match = re.match(r"^arn:aws:iam::(\d{12}):role/(.+)$", role_arn)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _role_selection_error(
+    candidates: list[dict[str, object]],
+) -> ToolResult:
     return result_from_payload({
-        "modelVersion": model_version,
-        "error": error,
+        "error": {
+            "type": "RoleSelectionRequired",
+            "message": "Multiple roles available. Specify options.accountId and options.roleName.",
+            "candidates": candidates,
+            "hint": (
+                "Choose one of the listed roles and re-run the command with "
+                "options={'accountId': '...', 'roleName': '...'}."
+            ),
+            "retryable": True,
+        },
     })
+
+
+def _identity_center_error(
+    message: str,
+    access_token: str | None,
+) -> ToolResult:
+    return _error_response(
+        "IdentityCenterError",
+        message,
+        hint="Re-authenticate with IAM Identity Center and try again.",
+        retryable=True,
+    )
+
+
+async def _resolve_identity_center_role_selection(
+    ctx,
+    options: dict[str, object],
+) -> tuple[str, str] | ToolResult:
+    request_ctx = get_request_context_optional()
+    if request_ctx is None or not request_ctx.access_token:
+        return _error_response(
+            "IdentityCenterAuthMissing",
+            "Missing Identity Center access token.",
+            hint="Provide an SSO access token via Authorization: Bearer <token>.",
+        )
+
+    account_id = options.get("accountId")
+    role_name = options.get("roleName")
+    role_arn = options.get("roleArn")
+
+    if role_arn and not (account_id or role_name):
+        parsed = _parse_role_arn(str(role_arn))
+        if parsed:
+            account_id, role_name = parsed
+
+    if (account_id and not role_name) or (role_name and not account_id):
+        return _error_response(
+            "RoleSelectionInvalid",
+            "Both options.accountId and options.roleName are required.",
+            hint="Provide both accountId and roleName (or a roleArn).",
+        )
+
+    provider = get_identity_center_provider()
+
+    if account_id and role_name:
+        try:
+            roles = await provider.list_account_roles(request_ctx.access_token, str(account_id))
+        except IdentityCenterError as exc:
+            return _identity_center_error(
+                str(exc),
+                request_ctx.access_token,
+            )
+        if not any(role.role_name == str(role_name) for role in roles):
+            return _error_response(
+                "RoleNotAssigned",
+                "The specified role is not assigned to this user.",
+                hint="Select a role from the available candidates.",
+            )
+        return str(account_id), str(role_name)
+
+    try:
+        accounts = await provider.list_accounts(request_ctx.access_token)
+    except IdentityCenterError as exc:
+        return _identity_center_error(
+            str(exc),
+            request_ctx.access_token,
+        )
+
+    # Fetch roles for all accounts in parallel to avoid N+1 API calls
+    async def fetch_roles_for_account(account):
+        roles = await provider.list_account_roles(request_ctx.access_token, account.account_id)
+        return account, roles
+
+    try:
+        results = await asyncio.gather(
+            *(fetch_roles_for_account(account) for account in accounts),
+            return_exceptions=True,
+        )
+    except Exception as exc:
+        return _identity_center_error(
+            str(exc),
+            request_ctx.access_token,
+        )
+
+    candidates: list[dict[str, object]] = []
+    for result in results:
+        if isinstance(result, IdentityCenterError):
+            return _identity_center_error(
+                str(result),
+                request_ctx.access_token,
+            )
+        if isinstance(result, Exception):
+            return _identity_center_error(
+                f"Unexpected error fetching roles: {result}",
+                request_ctx.access_token,
+            )
+        account, roles = result
+        for role in roles:
+            candidates.append({
+                "accountId": role.account_id,
+                "accountName": account.account_name,
+                "roleName": role.role_name,
+            })
+
+    if not candidates:
+        return _error_response(
+            "NoRolesAvailable",
+            "No roles are available for this Identity Center user.",
+            hint="Verify role assignments in IAM Identity Center.",
+        )
+
+    if len(candidates) == 1:
+        only = candidates[0]
+        return str(only["accountId"]), str(only["roleName"])
+
+    return _role_selection_error(candidates)
+
+
+async def _ensure_identity_center_credentials(
+    ctx,
+    account_id: str,
+    role_name: str,
+) -> ToolResult | None:
+    request_ctx = get_request_context_optional()
+    if request_ctx is None or not request_ctx.access_token:
+        return _error_response(
+            "IdentityCenterAuthMissing",
+            "Missing Identity Center access token.",
+            hint="Provide an SSO access token via Authorization: Bearer <token>.",
+        )
+
+    provider = get_identity_center_provider()
+    try:
+        temp_creds = await provider.get_cached_role_credentials(
+            request_ctx.access_token,
+            account_id,
+            role_name,
+            request_ctx.user_id,
+        )
+    except IdentityCenterError as exc:
+        return _identity_center_error(
+            str(exc),
+            request_ctx.access_token,
+        )
+
+    role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    aws_creds = AWSCredentials(
+        access_key_id=temp_creds.access_key_id,
+        secret_access_key=temp_creds.secret_access_key,
+        session_token=temp_creds.session_token,
+        expiration=temp_creds.expiration,
+    )
+    update_request_context(lambda c: c.with_aws_credentials(aws_creds, account_id, role_arn))
+    return None
+
+
+def _parse_json_arg(arg: object, name: str) -> dict | ToolResult:
+    """Parse JSON arg that might be string or dict."""
+    if isinstance(arg, dict):
+        return arg
+    if isinstance(arg, str):
+        try:
+            return json.loads(arg)
+        except json.JSONDecodeError as e:
+            if name == "payload":
+                return _error_response(
+                    "InvalidPayload",
+                    f"Failed to parse payload as JSON: {e}",
+                    hint="Provide payload as an object, not a string.",
+                )
+            # Fail gracefully for options
+            return {}
+    return {}
+
+
+async def _record_audit_log(
+    ctx,
+    tx_id,
+    op_id,
+    service,
+    operation,
+    op_payload,
+    status,
+    region,
+    is_new_tx,
+    model: SmithyModel,
+    operation_shape_id: str,
+    request_context: dict[str, object] | None = None,
+):
+    """Helper to record audit logs (Tx, Op, Artifact)."""
+    started_at = utc_now_iso()
+    request_ctx = get_request_context_optional()
+    actor = _actor_from_request_context()
+    account = request_ctx.aws_account_id if request_ctx else None
+    role = request_ctx.aws_role_arn if request_ctx else None
+    if request_context:
+        if request_context.get("accountId"):
+            account = str(request_context.get("accountId") or account)
+        if request_context.get("roleName"):
+            role = str(request_context.get("roleName") or role)
+
+    if is_new_tx:
+        await _run_blocking(ctx, ctx.store.create_tx, AuditTxRecord(
+            tx_id=tx_id,
+            plan_id=None,
+            status=status,
+            actor=actor,
+            role=role,
+            account=account,
+            region=str(region) if region else None,
+            started_at=started_at,
+            completed_at=None,
+        ))
+
+    request_hash = _compute_request_hash(op_payload, request_context)
+    request_payload, _ = inject_idempotency_tokens(
+        model, operation_shape_id, op_payload
+    )
+
+    op_record = AuditOpRecord(
+        op_id=op_id,
+        tx_id=tx_id,
+        service=service,
+        operation=operation,
+        request_hash=request_hash,
+        status=status,
+        duration_ms=None,
+        error=None,
+        response_summary=None,
+        created_at=started_at,
+    )
+    await _run_blocking(ctx, ctx.store.create_op, op_record)
+
+    request_artifact = await _run_blocking(
+        ctx,
+        ctx.artifacts.write_json,
+        "request", _redact(request_payload), prefix=tx_id
+    )
+    request_artifact.tx_id = tx_id
+    request_artifact.op_id = op_id
+    await _run_blocking(ctx, ctx.store.add_audit_artifact, request_artifact)
+
 
 
 def _coerce_payload_types(
@@ -703,7 +967,7 @@ def _coerce_payload_types(
     """Recursively coerce payload types to match Smithy model expectations.
 
     This function handles:
-    - blob: base64 string -> bytes, or $path -> read local file
+    - blob: base64 string -> bytes
     - integer/long/short/byte: string -> int
     - float/double: string -> float
     - boolean: string "true"/"false" -> bool
@@ -753,7 +1017,7 @@ def _coerce_payload_types(
         if target_shape is None:
             continue
 
-        # Handle blob type - decode base64 string to bytes or read $path
+        # Handle blob type - decode base64 string to bytes
         if target_shape.type == "blob":
             result[field_name] = _coerce_blob(value, field_path, service, operation)
 
@@ -799,56 +1063,24 @@ def _coerce_blob(
     path: str,
     service: str = "",
     operation: str = "",
-) -> bytes | list[tuple[str, bytes, str | None]]:
-    """Convert base64 string or $path specification to bytes.
+) -> bytes:
+    """Convert base64 string to bytes.
 
     Supports:
     - bytes: pass through
     - str: base64 decode
-    - dict with "$path": read local file
 
     Args:
         value: The value to coerce
         path: Field path for error messages
-        service: AWS service name (for $path size limits)
-        operation: Operation name (for $path folder support)
+        service: AWS service name (unused, kept for API compatibility)
+        operation: Operation name (unused, kept for API compatibility)
 
     Returns:
-        Bytes content, or list of (key, bytes, content_type) for S3 folder uploads
+        Bytes content
     """
-    import base64
-
-    from aws_cli_mcp.utils.local_file import (
-        FileTooLargeError,
-        FolderNotSupportedError,
-        LocalFileError,
-        PathNotFoundError,
-        is_path_spec,
-        resolve_path_for_blob,
-    )
-
     if isinstance(value, bytes):
         return value
-
-    # Handle $path specification
-    if is_path_spec(value):
-        field_name = path.split(".")[-1] if path else "Body"
-        try:
-            result = resolve_path_for_blob(
-                value,
-                service=service or "unknown",
-                operation=operation or "unknown",
-                field=field_name,
-            )
-            return result
-        except PathNotFoundError as e:
-            raise ValueError(f"Local file not found for '{path}': {e}")
-        except FileTooLargeError as e:
-            raise ValueError(str(e))
-        except FolderNotSupportedError as e:
-            raise ValueError(str(e))
-        except LocalFileError as e:
-            raise ValueError(f"Error reading local file for '{path}': {e}")
 
     if isinstance(value, str):
         try:
@@ -857,7 +1089,7 @@ def _coerce_blob(
             raise ValueError(f"Invalid base64 encoding for blob field '{path}': {e}")
 
     raise ValueError(
-        f"Expected base64 string, bytes, or {{\"$path\": \"...\"}} for blob field '{path}', "
+        f"Expected base64 string or bytes for blob field '{path}', "
         f"got {type(value).__name__}"
     )
 
@@ -941,8 +1173,6 @@ def _coerce_boolean(value: object, path: str) -> bool:
 
 def _coerce_timestamp(value: object, path: str) -> str:
     """Validate and normalize timestamp value."""
-    from datetime import datetime, timezone
-
     if not isinstance(value, str):
         if isinstance(value, (int, float)):
             # Unix timestamp - convert to ISO format
@@ -977,7 +1207,6 @@ def _coerce_timestamp(value: object, path: str) -> str:
             continue
 
     # Try parsing with timezone offset pattern (e.g., +09:00, -05:00)
-    import re
     tz_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2})?$'
     if re.match(tz_pattern, value):
         return value
@@ -1064,123 +1293,25 @@ def _coerce_map(
     return result
 
 
-def _is_s3_folder_upload(
-    service: str,
-    operation: str,
-    coerced_payload: dict[str, object],
-) -> bool:
-    """Check if this is an S3 folder upload (Body is a list of files)."""
-    if service.lower() != "s3" or operation != "PutObject":
-        return False
-    body = coerced_payload.get("Body")
-    return isinstance(body, list)
-
-
-def _execute_s3_folder_upload(
-    coerced_payload: dict[str, object],
-    region: str | None,
-) -> dict[str, object]:
-    """Execute S3 folder upload (multiple PutObject calls).
-
-    Args:
-        coerced_payload: Payload with Body as list of (key, bytes, content_type)
-        region: AWS region
-
-    Returns:
-        Summary of uploaded files
-    """
-    bucket = coerced_payload.get("Bucket")
-    file_list: list[tuple[str, bytes, str | None]] = coerced_payload.get("Body", [])
-
-    if not bucket:
-        raise ValueError("Bucket is required for S3 folder upload")
-
-    client = get_client("s3", region, None)
-    results: list[dict[str, object]] = []
-    errors: list[dict[str, object]] = []
-
-    for key, content, content_type in file_list:
-        try:
-            put_params: dict[str, object] = {
-                "Bucket": bucket,
-                "Key": key,
-                "Body": content,
-            }
-            if content_type:
-                put_params["ContentType"] = content_type
-
-            response = client.put_object(**put_params)
-            results.append({
-                "Key": key,
-                "ETag": response.get("ETag", ""),
-                "Size": len(content),
-            })
-        except Exception as e:
-            errors.append({
-                "Key": key,
-                "Error": str(e),
-            })
-
-    return {
-        "uploaded": len(results),
-        "failed": len(errors),
-        "files": results,
-        "errors": errors if errors else None,
-    }
-
-
-def _call_boto3(
+async def _call_boto3(
     service: str,
     operation: str,
     params: dict[str, object],
     region: str | None,
+    max_output_characters: int,
 ) -> dict[str, object]:
     """Call AWS via boto3."""
-    client = get_client(service, region, None)
+    client = await get_client_async(service, region, None)
     method_name = _snake_case(operation)
     if not hasattr(client, method_name):
         raise AttributeError(f"boto3 client for {service} has no method '{method_name}'")
-    callable_method = getattr(client, method_name)
-    response = callable_method(**params)
-
-    if isinstance(response, dict):
-        _read_streaming_fields(response)
-        return response
-    return {"result": response}
-
-
-def _read_streaming_fields(response: dict[str, object]) -> None:
-    """Read streaming body fields immediately after API call.
-
-    Some AWS operations return StreamingBody objects that must be read
-    before they can be serialized. This handles common streaming fields:
-    - S3 GetObject: Body
-    - Lambda Invoke: Payload
-    - Bedrock InvokeModel: body
-    - Polly SynthesizeSpeech: AudioStream
-    - Lex PostContent: audioStream
-    - MediaStoreData GetObject: Body
-    """
-    import base64
-
-    streaming_keys = ("Body", "Payload", "body", "AudioStream", "audioStream")
-    for key in streaming_keys:
-        if key not in response:
-            continue
-        obj = response[key]
-        if not (hasattr(obj, "read") and callable(obj.read)):
-            continue
-        try:
-            content = obj.read()
-            if isinstance(content, bytes):
-                try:
-                    response[key] = content.decode("utf-8")
-                except UnicodeDecodeError:
-                    response[key] = base64.b64encode(content).decode("utf-8")
-            else:
-                response[key] = content if content else ""
-        except Exception:
-            response[key] = ""
+    response = await call_aws_api_async(
+        client,
+        method_name,
+        max_output_characters=max_output_characters,
+        **params,
+    )
+    return response
 
 
 def _snake_case(name: str) -> str:
@@ -1191,7 +1322,6 @@ def _snake_case(name: str) -> str:
         ListEC2Instances -> list_ec2_instances
         GetAPIKey -> get_api_key
     """
-    import re
     # Insert underscore before uppercase letters that follow lowercase letters
     s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
     # Insert underscore before uppercase letters that are followed by lowercase letters
@@ -1209,7 +1339,6 @@ _RETRYABLE_CODES = {
 
 def _is_retryable(exc: Exception) -> bool:
     """Check if an exception is retryable."""
-    from botocore.exceptions import BotoCoreError, ClientError
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code")
         return code in _RETRYABLE_CODES
@@ -1222,6 +1351,19 @@ def _truncate_json(payload: dict[str, object], limit: int) -> str:
     if len(serialized) <= limit:
         return serialized
     return serialized[: limit - 3] + "..."
+
+
+def _limit_result_payload(payload: dict[str, object], max_chars: int) -> dict[str, object]:
+    """Limit result payload size by truncating serialized JSON output."""
+    safe_limit = max(128, max_chars)
+    serialized = json.dumps(payload, default=json_default, ensure_ascii=True)
+    if len(serialized) <= safe_limit:
+        return payload
+    return {
+        "truncated": True,
+        "maxCharacters": safe_limit,
+        "preview": serialized[: safe_limit - 3] + "...",
+    }
 
 
 SENSITIVE_KEYS = [
@@ -1251,7 +1393,7 @@ def _redact(value: object) -> object:
     return value
 
 
-aws_search_operations_tool = ToolSpec(
+search_operations_tool = ToolSpec(
     name="aws_search_operations",
     description=(
         "Step 1: Search AWS operations from Smithy models. "
@@ -1266,7 +1408,7 @@ aws_search_operations_tool = ToolSpec(
     handler=search_operations,
 )
 
-aws_get_operation_schema_tool = ToolSpec(
+get_operation_schema_tool = ToolSpec(
     name="aws_get_operation_schema",
     description=(
         "Step 2: Get the JSON Schema for an AWS operation. "
@@ -1279,33 +1421,25 @@ aws_get_operation_schema_tool = ToolSpec(
     handler=get_operation_schema,
 )
 
-aws_execute_tool = ToolSpec(
+execute_tool = ToolSpec(
     name="aws_execute",
     description=(
         "Validate and invoke AWS operations. "
         "Do NOT wrap arguments in a 'payload' object. "
         "Required top-level arguments: 'action' (enum: validate/invoke), "
         "'service' (string), 'operation' (string), 'payload' (object: API params). "
-        "Optional: 'region' (string), 'options' (object: skipApproval etc). "
+        "Optional: 'region' (string), 'options' (object: confirmationToken, "
+        "accountId/roleName for Identity Center). "
         "\n\n"
-        "LOCAL FILE UPLOAD: For binary fields (Body, ZipFile, etc.), use "
-        "{\"$path\": \"/local/path\"} instead of base64. "
-        "S3 supports folder upload (multiple files). Lambda auto-zips folders."
+        "BINARY DATA: For binary fields (Body, ZipFile, etc.), provide "
+        "base64-encoded content as a string."
         "\n\n"
         "Examples:\n"
         "1. List Lambda Functions:\n"
         "   call(action='invoke', service='lambda', operation='ListFunctions', payload={})\n"
-        "2. S3 Upload Local File:\n"
+        "2. S3 Upload (base64 body):\n"
         "   call(action='invoke', service='s3', operation='PutObject',\n"
-        "   payload={'Bucket': 'my-bucket', 'Key': 'file.png', "
-        "'Body': {'$path': '/path/to/file.png'}})\n"
-        "3. S3 Upload Folder:\n"
-        "   call(action='invoke', service='s3', operation='PutObject',\n"
-        "   payload={'Bucket': 'my-bucket', "
-        "'Body': {'$path': '/path/to/folder', 'keyPrefix': 'uploads/'}})\n"
-        "4. Lambda Deploy from Folder (auto-zip):\n"
-        "   call(action='invoke', service='lambda', operation='UpdateFunctionCode',\n"
-        "   payload={'FunctionName': 'my-func', 'ZipFile': {'$path': '/path/to/code'}})"
+        "   payload={'Bucket': 'my-bucket', 'Key': 'file.txt', 'Body': 'SGVsbG8gV29ybGQ='})"
     ),
     input_schema=EXECUTE_SCHEMA,
     handler=execute_operation,

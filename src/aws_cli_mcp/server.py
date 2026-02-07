@@ -15,6 +15,10 @@ from aws_cli_mcp.mcp_runtime import MCPServer
 from aws_cli_mcp.tools import register_tools
 
 
+def _is_http_transport(mode: str) -> bool:
+    return mode in {"http", "remote"}
+
+
 def build_server() -> MCPServer:
     """Create and configure the MCP server instance."""
 
@@ -28,20 +32,58 @@ def build_server() -> MCPServer:
     
     # Re-configure logging AFTER FastMCP init to ensure our handlers (FileHandler) persist
     configure_logging()
-    
+
     import logging
-    import sys
-    logging.info(f"Initializing AWS CLI MCP Server v{__version__}")
-    logging.info(f"Log file configured at: {settings.logging.file}")
-    
-    # Debug to stderr
-    print(f"[DEBUG] Log file path: {settings.logging.file}", file=sys.stderr)
+
+    logging.info("Initializing AWS CLI MCP Server v%s", __version__)
+    logging.info("Log file configured at: %s", settings.logging.file)
     register_tools(server)
     return server
 
 
-server = build_server()
+def run_entrypoint() -> None:
+    """Run the server based on transport settings."""
+    settings = load_settings()
+    if _is_http_transport(settings.server.transport_mode):
+        _run_http()
+        return
+    server = build_server()
+    server.run()
+
+
+def _run_http() -> None:
+    settings = load_settings()
+    from aws_cli_mcp.transport.http_server import create_http_app
+
+    try:
+        import uvicorn  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("uvicorn is required for HTTP transport mode") from exc
+
+    app = create_http_app()
+    uvicorn.run(app, host=settings.server.host, port=settings.server.port)
+
+
+def _module_init() -> MCPServer | None:
+    """Initialise the module-level server instance.
+
+    Separated from bare module scope so the side-effect (loading settings,
+    building a server) is explicit and testable.
+    """
+    _settings = load_settings()
+    if _is_http_transport(_settings.server.transport_mode):
+        return None
+    return build_server()
+
+
+server = _module_init()
 
 
 if __name__ == "__main__":  # pragma: no cover
-    server.run()
+    _settings = load_settings()
+    if _is_http_transport(_settings.server.transport_mode):
+        _run_http()
+    else:
+        if server is None:
+            server = build_server()
+        server.run()

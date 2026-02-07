@@ -187,7 +187,7 @@ class TestStructuredValidation(unittest.TestCase):
 class TestToolSchemas(unittest.TestCase):
 
     def test_search_schema_validation(self):
-        """Verify aws.searchOperations input validation."""
+        """Verify aws_search_operations input validation."""
         from aws_cli_mcp.tools.aws_unified import SEARCH_SCHEMA
 
         valid_payload = {"query": "lambda invoke"}
@@ -199,7 +199,7 @@ class TestToolSchemas(unittest.TestCase):
         self.assertNotEqual(errors, [])
 
     def test_get_schema_validation(self):
-        """Verify aws.getOperationSchema input validation."""
+        """Verify aws_get_operation_schema input validation."""
         from aws_cli_mcp.tools.aws_unified import GET_SCHEMA_SCHEMA
 
         valid_payload = {"service": "lambda", "operation": "Invoke"}
@@ -211,7 +211,7 @@ class TestToolSchemas(unittest.TestCase):
         self.assertNotEqual(errors, [])
 
     def test_execute_schema_validation(self):
-        """Verify aws.execute input validation."""
+        """Verify aws_execute input validation."""
         from aws_cli_mcp.tools.aws_unified import EXECUTE_SCHEMA
 
         valid_payload = {

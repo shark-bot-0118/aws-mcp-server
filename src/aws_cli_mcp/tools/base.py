@@ -16,5 +16,6 @@ def validate_or_raise(schema: dict[str, object], payload: dict[str, object]) -> 
 
 
 def result_from_payload(payload: dict[str, object]) -> ToolResult:
-    content = json.dumps(payload, ensure_ascii=True, indent=2, default=json_default)
+    text = json.dumps(payload, ensure_ascii=True, indent=2, default=json_default)
+    content = [{"type": "text", "text": text}]
     return ToolResult(content=content, structured_content=payload)

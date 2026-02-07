@@ -27,6 +27,8 @@ class PolicyEngine:
             risk: [re.compile(pat) for pat in pats]
             for risk, pats in config.risk_patterns.items()
         }
+        self._service_allowlist = frozenset(s.lower() for s in config.services.allowlist)
+        self._service_denylist = frozenset(s.lower() for s in config.services.denylist)
 
     def evaluate(self, operation: OperationRef, params: dict[str, object]) -> PolicyDecision:
         reasons: list[str] = []
@@ -75,14 +77,12 @@ class PolicyEngine:
         return True
 
     def is_service_allowed(self, service: str) -> bool:
-        allowlist = [s.lower() for s in self._config.services.allowlist]
-        denylist = [s.lower() for s in self._config.services.denylist]
         service_key = service.lower()
-        if not allowlist:
+        if not self._service_allowlist:
             return False
-        if service_key not in allowlist:
+        if service_key not in self._service_allowlist:
             return False
-        if service_key in denylist:
+        if service_key in self._service_denylist:
             return False
         return True
 

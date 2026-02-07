@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
@@ -36,13 +37,7 @@ class SmithySettings(BaseModel):
     sync_url: str | None = Field(default="https://github.com/aws/api-models-aws.git")
     sync_ref: str = Field(default="main")
     cache_path: str = Field(default="./data/smithy_cache")
-    auto_sync: bool = Field(default=True)
-    allowlist_services: list[str] = Field(default_factory=list)
-    allowlist_operations: list[str] = Field(default_factory=list)
-    default_model_version: str | None = Field(
-        default=None,
-        description="Pin to a specific model version (commit SHA). None uses latest.",
-    )
+    auto_sync: bool = Field(default=False)
     model_cache_size: int = Field(
         default=3,
         ge=1,
@@ -51,7 +46,43 @@ class SmithySettings(BaseModel):
     )
 
 
+class AuthSettings(BaseModel):
+    """Authentication settings.
 
+    Supports two modes:
+    - multi-idp: OAuth 2.0 Protected Resource with multiple IdPs (recommended)
+    - identity-center: AWS IAM Identity Center
+
+    For multi-idp mode, use AUTH_IDP_CONFIG_PATH to specify the IdP config file.
+    """
+
+    provider: Literal["multi-idp", "identity-center"] = Field(
+        default="multi-idp",
+        description="Auth provider: multi-idp | identity-center",
+    )
+    idp_config_path: str | None = Field(
+        default=None,
+        description="Path to idp_config.yaml for multi-idp mode",
+    )
+
+    # Credential caching
+    credential_refresh_buffer_seconds: int = Field(default=300, ge=0, le=3600)
+    credential_cache_max_entries: int = Field(default=1000, ge=1, le=10000)
+    allow_multi_user: bool = Field(
+        default=False,
+        description=(
+            "If False, only the first authenticated principal is accepted in this process. "
+            "Set True to allow multiple principals."
+        ),
+    )
+
+    identity_center_region: str | None = Field(default=None)
+
+
+class AWSSettings(BaseModel):
+    default_region: str | None = Field(default=None)
+    default_profile: str | None = Field(default=None)
+    sts_region: str = Field(default="us-east-1")
 
 
 class ServerSettings(BaseModel):
@@ -68,6 +99,11 @@ class ServerSettings(BaseModel):
         default=False,
         description="If True, skips the forced two-step confirmation for destructive operations.",
     )
+    transport_mode: str = Field(default="stdio")
+    http_allowed_origins: tuple[str, ...] = Field(default=())
+    http_allow_missing_origin: bool = Field(default=True)
+    http_enable_cors: bool = Field(default=False)
+    http_trust_forwarded_headers: bool = Field(default=False)
 
 
 class Settings(BaseModel):
@@ -77,13 +113,12 @@ class Settings(BaseModel):
     storage: StorageSettings = Field(default_factory=StorageSettings)
     policy: PolicySettings = Field(default_factory=PolicySettings)
     smithy: SmithySettings = Field(default_factory=SmithySettings)
-
-
-    aws_default_region: str | None = Field(default=None)
-    aws_default_profile: str | None = Field(default=None)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
+    aws: AWSSettings = Field(default_factory=AWSSettings)
 
 
 ENV_KEYS = {
+    "auth_provider": "AUTH_PROVIDER",
     "host": "MCP_HOST",
     "port": "MCP_PORT",
     "instructions": "MCP_INSTRUCTIONS",
@@ -95,26 +130,22 @@ ENV_KEYS = {
     "policy_path": "POLICY_PATH",
     "smithy_path": "SMITHY_MODEL_PATH",
     "smithy_sync_url": "SMITHY_SYNC_URL",
-    "smithy_allowlist_services": "SMITHY_ALLOWLIST_SERVICES",
-    "smithy_allowlist_operations": "SMITHY_ALLOWLIST_OPERATIONS",
     "smithy_cache_path": "SMITHY_CACHE_PATH",
     "smithy_sync_ref": "SMITHY_SYNC_REF",
     "smithy_auto_sync": "SMITHY_AUTO_SYNC",
-    "smithy_default_model_version": "SMITHY_DEFAULT_MODEL_VERSION",
     "smithy_model_cache_size": "SMITHY_MODEL_CACHE_SIZE",
     "aws_region": "AWS_DEFAULT_REGION",
     "aws_profile": "AWS_PROFILE",
     "max_retries": "AWS_MCP_MAX_RETRIES",
 }
 
-# Deprecated env keys (kept for backwards compatibility)
+_TRUE_VALUES = frozenset({"1", "true", "yes"})
 
 
-
-def _split_csv(value: str | None) -> list[str]:
+def _split_csv_preserve_case(value: str | None) -> list[str]:
     if not value:
         return []
-    return [item.strip().lower() for item in value.split(",") if item.strip()]
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _project_root() -> Path:
@@ -126,6 +157,20 @@ def _resolve_path(path: str) -> str:
     if candidate.is_absolute():
         return str(candidate)
     return str((_project_root() / candidate).resolve())
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = os.getenv(key)
+    if value is None:
+        return default
+    return value.strip().lower() in _TRUE_VALUES
+
+
+def _env_int(key: str, default: int) -> int:
+    value = os.getenv(key)
+    if value is None or value.strip() == "":
+        return default
+    return int(value)
 
 
 def load_settings() -> Settings:
@@ -141,40 +186,61 @@ def _load_settings_cached() -> Settings:
     settings_data: dict[str, object] = {
         "server": {
             "host": os.getenv(ENV_KEYS["host"], ServerSettings().host),
-            "port": int(os.getenv(ENV_KEYS["port"], ServerSettings().port)),
+            "port": _env_int(ENV_KEYS["port"], ServerSettings().port),
             "instructions": os.getenv(
                 ENV_KEYS["instructions"], ServerSettings().instructions
             ),
-            "require_approval": os.getenv(ENV_KEYS["require_approval"], "false").lower()
-            in {"1", "true", "yes"},
-            "auto_approve_destructive": os.getenv("AWS_MCP_AUTO_APPROVE_DESTRUCTIVE", "false").lower()
-            in {"1", "true", "yes"},
+            "require_approval": _env_bool(
+                ENV_KEYS["require_approval"], ServerSettings().require_approval
+            ),
+            "auto_approve_destructive": _env_bool(
+                "AWS_MCP_AUTO_APPROVE_DESTRUCTIVE",
+                ServerSettings().auto_approve_destructive,
+            ),
+            "transport_mode": os.getenv("TRANSPORT_MODE", ServerSettings().transport_mode),
+            "http_allowed_origins": tuple(
+                _split_csv_preserve_case(os.getenv("HTTP_ALLOWED_ORIGINS"))
+            ),
+            "http_allow_missing_origin": _env_bool(
+                "HTTP_ALLOW_MISSING_ORIGIN",
+                ServerSettings().http_allow_missing_origin,
+            ),
+            "http_enable_cors": _env_bool(
+                "HTTP_ENABLE_CORS",
+                ServerSettings().http_enable_cors,
+            ),
+            "http_trust_forwarded_headers": _env_bool(
+                "HTTP_TRUST_FORWARDED_HEADERS",
+                ServerSettings().http_trust_forwarded_headers,
+            ),
         },
         "logging": {
             "level": os.getenv(ENV_KEYS["log_level"], LoggingSettings().level),
-            "file": _resolve_path(os.getenv(ENV_KEYS["log_file"])) if os.getenv(ENV_KEYS["log_file"]) else None,
+            "file": (
+                _resolve_path(os.getenv(ENV_KEYS["log_file"]))
+                if os.getenv(ENV_KEYS["log_file"])
+                else None
+            ),
         },
         "execution": {
-            "sdk_timeout_seconds": int(
-                os.getenv(
-                    "SDK_TIMEOUT_SECONDS", ExecutionSettings().sdk_timeout_seconds
-                )
+            "sdk_timeout_seconds": _env_int(
+                "SDK_TIMEOUT_SECONDS",
+                ExecutionSettings().sdk_timeout_seconds,
             ),
-            "max_output_characters": int(
-                os.getenv(
-                    "MAX_OUTPUT_CHARACTERS",
-                    ExecutionSettings().max_output_characters,
-                )
+            "max_output_characters": _env_int(
+                "MAX_OUTPUT_CHARACTERS",
+                ExecutionSettings().max_output_characters,
             ),
-            "max_retries": int(
-                os.getenv(ENV_KEYS["max_retries"], ExecutionSettings().max_retries)
+            "max_retries": _env_int(
+                ENV_KEYS["max_retries"],
+                ExecutionSettings().max_retries,
             ),
         },
         "storage": {
             "sqlite_path": _resolve_path(
                 os.getenv(ENV_KEYS["sqlite_path"], StorageSettings().sqlite_path)
             ),
-            "sqlite_wal": os.getenv("SQLITE_WAL", "true").lower() in {"1", "true", "yes"},
+            "sqlite_wal": _env_bool("SQLITE_WAL", StorageSettings().sqlite_wal),
             "artifact_path": _resolve_path(
                 os.getenv(ENV_KEYS["artifact_path"], StorageSettings().artifact_path)
             ),
@@ -193,22 +259,44 @@ def _load_settings_cached() -> Settings:
             "cache_path": _resolve_path(
                 os.getenv(ENV_KEYS["smithy_cache_path"], SmithySettings().cache_path)
             ),
-            "auto_sync": os.getenv(ENV_KEYS["smithy_auto_sync"], "true").lower()
-            in {"1", "true", "yes"},
-            "allowlist_services": _split_csv(
-                os.getenv(ENV_KEYS["smithy_allowlist_services"])
+            "auto_sync": _env_bool(
+                ENV_KEYS["smithy_auto_sync"],
+                SmithySettings().auto_sync,
             ),
-            "allowlist_operations": _split_csv(
-                os.getenv(ENV_KEYS["smithy_allowlist_operations"])
-            ),
-            "default_model_version": os.getenv(ENV_KEYS["smithy_default_model_version"]),
-            "model_cache_size": int(
-                os.getenv(ENV_KEYS["smithy_model_cache_size"], SmithySettings().model_cache_size)
+            "model_cache_size": _env_int(
+                ENV_KEYS["smithy_model_cache_size"],
+                SmithySettings().model_cache_size,
             ),
         },
+        "auth": {
+            "provider": os.getenv(ENV_KEYS["auth_provider"], AuthSettings().provider),
+            "idp_config_path": (
+                _resolve_path(os.getenv("AUTH_IDP_CONFIG_PATH"))
+                if os.getenv("AUTH_IDP_CONFIG_PATH")
+                else None
+            ),
+            "credential_refresh_buffer_seconds": _env_int(
+                "AUTH_CREDENTIAL_REFRESH_BUFFER_SECONDS",
+                AuthSettings().credential_refresh_buffer_seconds,
+            ),
+            "credential_cache_max_entries": _env_int(
+                "AUTH_CREDENTIAL_CACHE_MAX_ENTRIES",
+                AuthSettings().credential_cache_max_entries,
+            ),
+            "allow_multi_user": _env_bool(
+                "AUTH_ALLOW_MULTI_USER",
+                AuthSettings().allow_multi_user,
+            ),
+            "identity_center_region": os.getenv(
+                "AUTH_IDENTITY_CENTER_REGION", AuthSettings().identity_center_region
+            ),
+        },
+        "aws": {
+            "default_region": os.getenv("AWS_REGION") or os.getenv(ENV_KEYS["aws_region"]),
+            "default_profile": os.getenv(ENV_KEYS["aws_profile"]),
+            "sts_region": os.getenv("AWS_STS_REGION", AWSSettings().sts_region),
+        },
 
-        "aws_default_region": os.getenv("AWS_REGION") or os.getenv(ENV_KEYS["aws_region"]),
-        "aws_default_profile": os.getenv(ENV_KEYS["aws_profile"]),
     }
 
     try:

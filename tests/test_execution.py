@@ -41,7 +41,7 @@ def test_get_client_caching(mock_session_cls, mock_settings, clear_cache):
     
 def test_get_client_s3_config(clear_cache):
     with patch("aws_cli_mcp.execution.aws_client.boto3.Session"):
-        with patch("aws_cli_mcp.execution.aws_client.Config"):
+        with patch("aws_cli_mcp.execution.aws_client.Config") as MockConfig:
              mock_settings = MagicMock()
              with patch("aws_cli_mcp.execution.aws_client.load_settings", return_value=mock_settings):
                  get_client("s3", None, None)
@@ -53,7 +53,7 @@ def test_get_client_s3_config(clear_cache):
 
 def test_get_client_other_config(clear_cache):
     with patch("aws_cli_mcp.execution.aws_client.boto3.Session"):
-        with patch("aws_cli_mcp.execution.aws_client.Config"):
+        with patch("aws_cli_mcp.execution.aws_client.Config") as MockConfig:
              mock_settings = MagicMock()
              with patch("aws_cli_mcp.execution.aws_client.load_settings", return_value=mock_settings):
                  get_client("ec2", None, None)

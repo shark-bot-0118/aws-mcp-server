@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +21,7 @@ class SqliteStore:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         if wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -118,12 +120,14 @@ class SqliteStore:
         self._conn.commit()
 
     def execute(self, query: str, params: Iterable[object]) -> None:
-        self._conn.execute(query, params)
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(query, params)
+            self._conn.commit()
 
     def fetch_one(self, query: str, params: Iterable[object]) -> sqlite3.Row | None:
-        cur = self._conn.execute(query, params)
-        return cur.fetchone()
+        with self._lock:
+            cur = self._conn.execute(query, params)
+            return cur.fetchone()
 
 
 
@@ -158,6 +162,15 @@ class SqliteStore:
         data.pop("approval_id", None)
         data.pop("approval_actor", None)
         return AuditTxRecord(**data)
+
+    def get_pending_op(self, tx_id: str) -> AuditOpRecord | None:
+        row = self.fetch_one(
+            "SELECT * FROM audit_op WHERE tx_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+            (tx_id, "PendingConfirmation"),
+        )
+        if row is None:
+            return None
+        return AuditOpRecord(**dict(row))
 
     def update_tx_status(self, tx_id: str, status: str, completed_at: str | None) -> None:
         self.execute(
@@ -243,38 +256,39 @@ class SqliteStore:
         cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
         cutoff_iso = cutoff_dt.isoformat().replace("+00:00", "Z")
 
-        # Find expired tx_ids
-        rows = self._conn.execute(
-            "SELECT tx_id FROM audit_tx WHERE status = 'PendingConfirmation' AND started_at < ?",
-            (cutoff_iso,),
-        ).fetchall()
+        with self._lock:
+            # Find expired tx_ids
+            rows = self._conn.execute(
+                "SELECT tx_id FROM audit_tx WHERE status = 'PendingConfirmation' AND started_at < ?",
+                (cutoff_iso,),
+            ).fetchall()
 
-        if not rows:
-            return 0
+            if not rows:
+                return 0
 
-        expired_tx_ids = [row["tx_id"] for row in rows]
-        
-        # We need to delete associated operations and artifacts first if CASCADE is not on.
-        # Since we use executemany or "IN" clause.
-        placeholders = ",".join("?" for _ in expired_tx_ids)
-        
-        # 1. Delete associated artifacts (linked via tx_id)
-        self._conn.execute(
-            f"DELETE FROM audit_artifacts WHERE tx_id IN ({placeholders})",
-            expired_tx_ids,
-        )
+            expired_tx_ids = [row["tx_id"] for row in rows]
+            
+            # We need to delete associated operations and artifacts first if CASCADE is not on.
+            # Since we use executemany or "IN" clause.
+            placeholders = ",".join("?" for _ in expired_tx_ids)
+            
+            # 1. Delete associated artifacts (linked via tx_id)
+            self._conn.execute(
+                f"DELETE FROM audit_artifacts WHERE tx_id IN ({placeholders})",
+                expired_tx_ids,
+            )
 
-        # 2. Delete associated operations
-        self._conn.execute(
-            f"DELETE FROM audit_op WHERE tx_id IN ({placeholders})",
-            expired_tx_ids,
-        )
+            # 2. Delete associated operations
+            self._conn.execute(
+                f"DELETE FROM audit_op WHERE tx_id IN ({placeholders})",
+                expired_tx_ids,
+            )
 
-        # 3. Delete the transactions
-        cursor = self._conn.execute(
-            f"DELETE FROM audit_tx WHERE tx_id IN ({placeholders})",
-            expired_tx_ids,
-        )
-        self._conn.commit()
+            # 3. Delete the transactions
+            cursor = self._conn.execute(
+                f"DELETE FROM audit_tx WHERE tx_id IN ({placeholders})",
+                expired_tx_ids,
+            )
+            self._conn.commit()
 
-        return cursor.rowcount
+            return cursor.rowcount

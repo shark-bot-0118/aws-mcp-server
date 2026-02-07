@@ -128,13 +128,9 @@ class SchemaGenerator:
             return {"type": "string", "format": "date-time"}
         if shape_type == "blob":
             return {
-                "type": ["string", "object"],
+                "type": "string",
                 "format": "byte",
-                "description": (
-                    "Binary data. Accepts: (1) base64-encoded string, or "
-                    "(2) {\"$path\": \"/local/file/path\"} to upload from local filesystem. "
-                    "For S3/Lambda, folders are also supported for batch upload."
-                ),
+                "description": "Binary data. Provide as base64-encoded string.",
             }
         return {"type": "string"}
 

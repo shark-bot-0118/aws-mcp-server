@@ -7,6 +7,8 @@ import sys
 
 from aws_cli_mcp.config import load_settings
 
+_logging_configured = False
+
 
 def configure_logging() -> None:
     """Configure structured logging for the server."""
@@ -50,7 +52,11 @@ def configure_logging() -> None:
 
     logging.basicConfig(level=level, handlers=handlers, force=True)
 
+    global _logging_configured
+    _logging_configured = True
+
 
 def get_logger(name: str) -> logging.Logger:
-    configure_logging()
+    if not _logging_configured:
+        configure_logging()
     return logging.getLogger(name)

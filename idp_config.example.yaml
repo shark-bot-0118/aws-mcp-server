@@ -1,0 +1,126 @@
+# OAuth 2.0 Protected Resource Configuration (EXAMPLE)
+# Copy this file to 'idp_config.yaml' and configure it for your environment.
+#
+# Environment variables can be used with ${VAR} or $VAR syntax.
+
+# Identity Providers (allowlist)
+# Configure at least one IdP.
+idps:
+  # Example: Microsoft Entra ID (Azure AD)
+  - name: entra
+    # The issuer URL must match the 'iss' claim in the access token EXACTLY
+    issuer: "https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0"
+
+    # Audience validation
+    # The 'aud' (or 'azp' if present) claim must match one of these values
+    audience:
+      - "api://${ENTRA_CLIENT_ID}"
+      - "${ENTRA_CLIENT_ID}"
+
+    # Allowed signing algorithms (default: RS256, ES256)
+    allowed_algorithms: ["RS256"]
+
+    # Clock skew tolerance for expiration checks
+    clock_skew_seconds: 30
+
+    # Claims mapping to standard internal fields
+    claims_mapping:
+      user_id: oid # Map 'oid' claim to 'user_id'
+      email: email
+      groups: groups
+
+  # Example: Auth0
+  # - name: auth0
+  #   issuer: "https://${AUTH0_DOMAIN}/"
+  #   audience:
+  #     - "https://api.myapp.com"
+  #   claims_mapping:
+  #     user_id: sub
+  #     email: email
+
+# JWKS (JSON Web Key Set) Caching Strategy
+jwks_cache:
+  ttl_seconds: 3600 # Cache keys for 1 hour
+  refresh_before_seconds: 300 # Refresh 5 minutes before expiry
+  failure_backoff_seconds: 60 # Wait 60s if fetch fails
+  max_retries: 3
+
+# Role Mappings
+# Maps authenticated users to AWS IAM Roles.
+# This server does NOT create roles; it only assumes existing ones.
+role_mappings:
+  # 1. Map by Email Domain
+  - email_domain: "example.com"
+    account_id: "123456789012"
+    role_arn: "arn:aws:iam::123456789012:role/MCP-Developer"
+
+  # 2. Map by Specific User ID
+  - user_id: "user-unique-id-123"
+    account_id: "123456789012"
+    role_arn: "arn:aws:iam::123456789012:role/MCP-Admin"
+
+  # 3. Map by Group (if supported by IdP)
+  - groups: ["admins", "superusers"]
+    account_id: "123456789012"
+    role_arn: "arn:aws:iam::123456789012:role/MCP-Admin"
+
+# Security Limits
+# Source values from .env AUTH_* keys to keep one source of truth.
+security:
+  rate_limit_per_user: ${AUTH_RATE_LIMIT_PER_USER} # req/min
+  rate_limit_per_ip: ${AUTH_RATE_LIMIT_PER_IP} # req/min
+  max_body_size_mb: ${AUTH_MAX_BODY_SIZE_MB}
+  max_header_size_kb: ${AUTH_MAX_HEADER_SIZE_KB}
+  request_timeout_seconds: ${AUTH_REQUEST_TIMEOUT_SECONDS}
+
+# Audit Logging
+audit:
+  enabled: true
+  # Sensitive fields to redact from logs
+  mask_fields:
+    - access_token
+    - refresh_token
+    - id_token
+    - secret
+    - password
+    - credential
+
+# Protected Resource Metadata (RFC 9728)
+# Exposed at /.well-known/oauth-protected-resource
+protected_resource:
+  # Use a single string value. "auto" derives scheme/host from incoming request
+  # and appends /mcp (useful for local development and reverse proxy setups).
+  resource: "auto"
+  scopes_supported:
+    - openid
+    - profile
+    - offline_access
+    # Claude Code/Desktop + Entra default:
+    # keep discovery scopes OIDC-only to avoid invalid_target.
+    #
+    # Optional when your IdP/API registration supports it:
+    # - "{resource}/aws.execute"
+    # - "api://<RESOURCE_APP_ID>/aws.execute"
+  bearer_methods_supported:
+    - header
+  resource_documentation: "https://docs.example.com/mcp-auth"
+
+# OAuth Proxy/Broker Mode (optional)
+# Enable when direct Entra integration fails due resource/scope mismatch.
+oauth_proxy:
+  enabled: false
+  upstream_idp: "entra"
+  upstream_client_id: "${ENTRA_PROXY_CLIENT_ID}"
+  upstream_client_secret: "${ENTRA_PROXY_CLIENT_SECRET}" # Optional when using public client
+  # auto: send client_secret only when configured
+  # client_secret_post: always send client_secret (confidential client)
+  # none: never send client_secret (public client)
+  upstream_token_auth_method: "auto"
+  upstream_scopes:
+    - openid
+    - profile
+    - offline_access
+    - "api://${ENTRA_CLIENT_ID}/aws.execute"
+  redirect_path: "/oauth/callback"
+  auth_code_ttl_seconds: 300
+  transaction_ttl_seconds: 300

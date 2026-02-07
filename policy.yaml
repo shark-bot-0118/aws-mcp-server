@@ -2,6 +2,8 @@ version: 1
 
 services:
   allowlist:
+    # Tool-exposed services (internal STS for AssumeRoleWithWebIdentity is not governed here)
+    - sts
     - ec2
     - iam
     - lambda

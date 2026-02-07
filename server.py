@@ -10,7 +10,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from aws_cli_mcp.server import server
+from aws_cli_mcp.server import run_entrypoint
 
 if __name__ == "__main__":
-    server.run()
+    run_entrypoint()

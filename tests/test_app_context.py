@@ -21,9 +21,8 @@ def clean_context():
 @patch("aws_cli_mcp.app.init_version_manager")
 @patch("aws_cli_mcp.app.SmithyCatalog")
 @patch("aws_cli_mcp.app.SchemaGenerator")
-@patch("aws_cli_mcp.app.get_model_commit_sha")
 def test_app_context_initialization(
-    mock_get_sha, mock_gen, mock_cat, mock_init_ver, mock_resolve,
+    mock_gen, mock_cat, mock_init_ver, mock_resolve,
     mock_load_paths, mock_load_full, mock_sync, mock_artifacts, mock_store,
     mock_engine, mock_load_policy, mock_load_settings, clean_context
 ):
@@ -42,7 +41,6 @@ def test_app_context_initialization(
     
     mock_smithy = MagicMock()
     mock_smithy.cache_path = "cache"
-    mock_smithy.default_model_version = None
     mock_smithy.model_cache_size = 5
     settings.smithy = mock_smithy
     
@@ -57,7 +55,6 @@ def test_app_context_initialization(
     mock_sync.return_value = "model_path"
     mock_resolve.return_value = {"s3": "path/to/s3.json"}
     mock_load_paths.return_value = MagicMock() # The loaded model
-    mock_get_sha.return_value = "sha123"
 
     # Run
     ctx = get_app_context()
@@ -70,7 +67,7 @@ def test_app_context_initialization(
     mock_load_paths.assert_called_once()
     mock_load_full.assert_not_called() # Should use paths
     mock_init_ver.assert_called_once()
-    assert ctx.model_version == "sha123"
+    assert not hasattr(ctx, "model_version")
 
 @patch("aws_cli_mcp.app.load_settings")
 @patch("aws_cli_mcp.app.load_policy")
@@ -90,7 +87,6 @@ def test_app_context_no_allowlist(
     # Setup Settings
     settings = MagicMock(spec=Settings)
     mock_smithy = MagicMock()
-    mock_smithy.default_model_version = "v1"
     mock_smithy.cache_path = "cache"
     mock_smithy.model_cache_size = 5
     settings.smithy = mock_smithy
@@ -119,4 +115,4 @@ def test_app_context_no_allowlist(
     
     # Verification
     mock_load_full.assert_called_once_with("model_path")
-    assert ctx.model_version == "v1"
+    assert not hasattr(ctx, "model_version")

@@ -16,7 +16,7 @@ from aws_cli_mcp.smithy.loader import load_models, load_models_from_paths
 from aws_cli_mcp.smithy.parser import SmithyModel
 from aws_cli_mcp.smithy.registry import resolve_service_model_paths
 from aws_cli_mcp.smithy.schema_generator import SchemaGenerator
-from aws_cli_mcp.smithy.sync import get_model_commit_sha, sync_models
+from aws_cli_mcp.smithy.sync import sync_models
 from aws_cli_mcp.smithy.version_manager import init_version_manager
 
 
@@ -35,7 +35,6 @@ class AppContext:
     schema_generator: SchemaGenerator
     policy_engine: PolicyEngine
     smithy_model: SmithyModel
-    model_version: str
 
 
 @lru_cache(maxsize=1)
@@ -54,8 +53,6 @@ def get_app_context() -> AppContext:
 
     model_path = sync_models(settings.smithy)
     service_allowlist = [s.lower() for s in policy_config.services.allowlist]
-
-    model_version = _get_model_version(settings, model_path)
 
     if service_allowlist:
         paths = resolve_service_model_paths(model_path, service_allowlist)
@@ -91,23 +88,4 @@ def get_app_context() -> AppContext:
         schema_generator=schema_generator,
         policy_engine=policy_engine,
         smithy_model=smithy_model,
-        model_version=model_version,
     )
-
-
-def _get_model_version(settings: Settings, model_path: str) -> str:
-    """Determine the model version to use.
-
-    Priority:
-    1. Explicit default_model_version from settings
-    2. Git commit SHA from the cached repository
-    3. Fallback to 'latest'
-    """
-    if settings.smithy.default_model_version:
-        return settings.smithy.default_model_version
-
-    commit_sha = get_model_commit_sha(settings.smithy.cache_path)
-    if commit_sha:
-        return commit_sha
-
-    return "latest"

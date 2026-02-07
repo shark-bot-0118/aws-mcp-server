@@ -51,12 +51,12 @@ def test_simple_server_tools_call(monkeypatch):
     monkeypatch.setattr(sys, "stdout", stdout)
     
     server = _SimpleMCPServer("test", "1.0", "inst")
-    server.add_tool(ToolSpec("t1", "desc", {}, lambda x: ToolResult(content="ok")))
+    server.add_tool(ToolSpec("t1", "desc", {}, lambda x: ToolResult(content=[{"type": "text", "text": "ok"}])))
     server.run()
     
     out = stdout.getvalue()
     msg = json.loads(out)
-    assert msg["result"]["content"] == "ok"
+    assert msg["result"]["content"] == [{"type": "text", "text": "ok"}]
 
 def test_simple_server_call_unknown(monkeypatch):
     stdin = StringIO(json.dumps({ "method": "tools/call", "params": {"name": "uk"}}) + "\n")

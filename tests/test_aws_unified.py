@@ -10,7 +10,6 @@ from aws_cli_mcp.tools.aws_unified import (
     _is_retryable,
     _redact,
     _truncate_json,
-    _read_streaming_fields,
     _snake_case
 )
 from aws_cli_mcp.domain.operations import OperationRef
@@ -18,35 +17,40 @@ from aws_cli_mcp.domain.operations import OperationRef
 @pytest.fixture
 def mock_ctx():
     with patch("aws_cli_mcp.tools.aws_unified.get_app_context") as mock_get:
-        ctx = MagicMock()
-        mock_get.return_value = ctx
-        
-        # Setup common context attributes
-        ctx.model_version = "test-version"
-        ctx.settings.smithy.allowlist_services = None # Allow all by default
-        ctx.settings.smithy.allowlist_operations = None
-        ctx.settings.server.require_approval = False
-        ctx.settings.server.auto_approve_destructive = False
-        ctx.settings.execution.max_retries = 1
-        
-        # Mock components
-        ctx.catalog = MagicMock()
-        ctx.policy_engine = MagicMock()
-        ctx.schema_generator = MagicMock()
-        ctx.store = MagicMock()
-        ctx.artifacts = MagicMock()
-        ctx.smithy_model = MagicMock()
-        
-        # Default policy to allowed
-        ctx.policy_engine.is_service_allowed.return_value = True
-        ctx.policy_engine.is_operation_allowed.return_value = True
-        ctx.policy_engine.risk_for_operation.return_value = "low"
-        
-        yield ctx
+        with patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot") as mock_load_snapshot:
+            ctx = MagicMock()
+            mock_get.return_value = ctx
+
+            # Setup common context attributes
+            ctx.settings.server.require_approval = False
+            ctx.settings.server.auto_approve_destructive = False
+            ctx.settings.execution.max_retries = 1
+
+            # Mock components
+            ctx.catalog = MagicMock()
+            ctx.policy_engine = MagicMock()
+            ctx.schema_generator = MagicMock()
+            ctx.store = MagicMock()
+            ctx.artifacts = MagicMock()
+            ctx.smithy_model = MagicMock()
+
+            # Default policy to allowed
+            ctx.policy_engine.is_service_allowed.return_value = True
+            ctx.policy_engine.is_operation_allowed.return_value = True
+            ctx.policy_engine.risk_for_operation.return_value = "low"
+
+            # Setup snapshot mock
+            mock_snapshot = MagicMock()
+            mock_snapshot.catalog = ctx.catalog
+            mock_snapshot.schema_generator = ctx.schema_generator
+            mock_snapshot.model = ctx.smithy_model
+            mock_load_snapshot.return_value = mock_snapshot
+
+            yield ctx
 
 @pytest.fixture
 def mock_sleep():
-    with patch("time.sleep") as mock:
+    with patch("asyncio.sleep") as mock:
         yield mock
 
 def test_search_operations(mock_ctx):
@@ -95,7 +99,8 @@ def test_get_operation_schema_not_found(mock_ctx):
     with pytest.raises(ValueError, match="Operation not found"):
         get_operation_schema({"service": "unknown", "operation": "Unknown"})
 
-def test_execute_validate_success(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_validate_success(mock_ctx):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -110,7 +115,7 @@ def test_execute_validate_success(mock_ctx):
         mock_decision.reasons = [] # Added reasons
         mock_ctx.policy_engine.evaluate.return_value = mock_decision
         
-        result = execute_operation({
+        result = await execute_operation({
             "action": "validate",
             "service": "s3",
             "operation": "ListBuckets",
@@ -120,7 +125,8 @@ def test_execute_validate_success(mock_ctx):
         data = json.loads(result.content)
         assert data["valid"] is True
 
-def test_execute_invoke_success(mock_ctx, mock_sleep):
+@pytest.mark.asyncio
+async def test_execute_invoke_success(mock_ctx, mock_sleep):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -139,7 +145,7 @@ def test_execute_invoke_success(mock_ctx, mock_sleep):
                     mock_decision.require_approval = False # explicit
                     mock_ctx.policy_engine.evaluate.return_value = mock_decision
                     
-                    result = execute_operation({
+                    result = await execute_operation({
                         "action": "invoke",
                         "service": "s3",
                         "operation": "ListBuckets",
@@ -188,27 +194,9 @@ def test_truncate_json():
     assert len(truncated) <= 50
     assert truncated.endswith("...")
 
-def test_read_streaming_fields():
-    from io import BytesIO
-    # Case 1: Bytes
-    body = BytesIO(b"Hello")
-    response = {"Body": body}
-    _read_streaming_fields(response)
-    assert response["Body"] == "Hello"
-    
-    # Case 2: String (shouldn't happen for Body usually but code handles it)
-    response = {"Body": "StringContent"}
-    _read_streaming_fields(response)
-    assert response["Body"] == "StringContent"
-    
-    # Case 3: Error reading
-    mock_body = MagicMock()
-    mock_body.read.side_effect = Exception("Read failed")
-    response = {"Body": mock_body}
-    _read_streaming_fields(response)
-    assert response["Body"] == ""
 
-def test_confirmation_flow(mock_ctx):
+@pytest.mark.asyncio
+async def test_confirmation_flow(mock_ctx):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -224,7 +212,7 @@ def test_confirmation_flow(mock_ctx):
         mock_ctx.settings.server.auto_approve_destructive = False
         
         # Case 1: Confirmation required (no token)
-        result = execute_operation({
+        result = await execute_operation({
             "action": "invoke",
             "service": "s3",
             "operation": "DeleteBucket",
@@ -244,7 +232,18 @@ def test_confirmation_flow(mock_ctx):
         with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
             with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
                 with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={"Success": True}):
-                    result = execute_operation({
+                    # Mock _run_blocking (since it's an async conceptual thing)
+                    # The code uses _run_blocking for DB/Artifacts which is awaiting
+                    # But store.get_tx is mocked to return sync object
+                    # We might need to handle await on the result of store calls if they are async in production?
+                    # In tools/aws_unified.py:
+                    # pending_tx = await _run_blocking(ctx, ctx.store.get_tx, confirmation_token)
+                    # _run_blocking returns the result of func.
+                    # As long as mock_ctx.store.get_tx returns a value, _run_blocking will return it (or await it if it's a coro)
+                    # Wait, _run_blocking calls asyncio.to_thread(func).
+                    # So func must be synchronous.
+                    
+                    result = await execute_operation({
                         "action": "invoke",
                         "service": "s3",
                         "operation": "DeleteBucket",
@@ -257,7 +256,7 @@ def test_confirmation_flow(mock_ctx):
                     
         # Case 3: Invalid/Expired Token
         mock_ctx.store.get_tx.return_value = None
-        result = execute_operation({
+        result = await execute_operation({
             "action": "invoke",
             "service": "s3",
             "operation": "DeleteBucket",
@@ -307,48 +306,8 @@ def test_coercion_complex_types(mock_ctx):
     # Unix timestamp
     assert "2024" in _coerce_timestamp(1704067200, "") # Just check it converts to string
 
-# def test_is_exposed(mock_ctx):
-#     mock_entry = MagicMock()
-#     mock_entry.ref = OperationRef("s3", "ListBuckets")
-#     
-#     # Case 1: Allowed
-#     mock_ctx.settings.smithy.allowlist_services = None
-#     mock_ctx.policy_engine.is_service_allowed.return_value = True
-#     mock_ctx.policy_engine.is_operation_allowed.return_value = True
-#     
-#     # Access private function? No, search_operations uses it.
-#     mock_ctx.catalog.search.return_value = [mock_entry]
-#     result = search_operations({"query": "s3"})
-#     assert json.loads(result.content)["count"] == 1
-#     
-#     # Case 2: Service not allowed by policy
-#     mock_ctx.policy_engine.is_service_allowed.return_value = False
-#     result = search_operations({"query": "s3"})
-#     assert json.loads(result.content)["count"] == 0
-#     
-#     # Case 3: Service allowed, but not in allowlist settings
-#     mock_ctx.policy_engine.is_service_allowed.return_value = True
-#     mock_ctx.settings.smithy.allowlist_services = ["ec2"]
-#     result = search_operations({"query": "s3"})
-#     assert json.loads(result.content)["count"] == 0
-# 
-# def test_is_exposed_operation_allowlist(mock_ctx):
-#     mock_entry = MagicMock()
-#     mock_entry.ref = OperationRef("s3", "ListBuckets")
-#     mock_ctx.catalog.search.return_value = [mock_entry]
-# 
-#     # Case: Operation allowlist is active
-#     mock_ctx.settings.smithy.allowlist_services = None
-#     mock_ctx.settings.smithy.allowlist_operations = ["s3:ListBuckets"]
-#     result = search_operations({"query": "s3"})
-#     assert json.loads(result.content)["count"] == 1
-# 
-#     # Case: Operation not in allowlist
-#     mock_ctx.settings.smithy.allowlist_operations = ["s3:OtherOp"]
-#     result = search_operations({"query": "s3"})
-#     assert json.loads(result.content)["count"] == 0
-
-def test_execute_json_string_parsing(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_json_string_parsing(mock_ctx):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -359,7 +318,7 @@ def test_execute_json_string_parsing(mock_ctx):
         
         # Valid JSON strings
         with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={}):
-            result = execute_operation({
+            result = await execute_operation({
                 "action": "invoke",
                 "service": "s3",
                 "operation": "ListBuckets",
@@ -369,7 +328,7 @@ def test_execute_json_string_parsing(mock_ctx):
             assert "result" in json.loads(result.content)
 
         # Invalid JSON payload
-        result = execute_operation({
+        result = await execute_operation({
             "action": "validate",
             "service": "s3",
             "operation": "ListBuckets",
@@ -380,7 +339,7 @@ def test_execute_json_string_parsing(mock_ctx):
 
         # Invalid JSON options (fall back to empty dict)
         with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={}):
-             result = execute_operation({
+             result = await execute_operation({
                 "action": "invoke",
                 "service": "s3",
                 "operation": "ListBuckets",
@@ -389,9 +348,10 @@ def test_execute_json_string_parsing(mock_ctx):
             })
              assert "result" in json.loads(result.content)
 
-def test_execute_operation_not_found(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_operation_not_found(mock_ctx):
     mock_ctx.catalog.find_operation.return_value = None
-    result = execute_operation({
+    result = await execute_operation({
         "action": "validate",
         "service": "s3",
         "operation": "Unknown",
@@ -400,12 +360,13 @@ def test_execute_operation_not_found(mock_ctx):
     data = json.loads(result.content)
     assert data["error"]["type"] == "OperationNotFound"
 
-def test_execute_operation_not_exposed(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_operation_not_exposed(mock_ctx):
     mock_entry = MagicMock()
     mock_ctx.catalog.find_operation.return_value = mock_entry
     mock_ctx.policy_engine.is_service_allowed.return_value = False
     
-    result = execute_operation({
+    result = await execute_operation({
         "action": "validate",
         "service": "s3",
         "operation": "ListBuckets",
@@ -414,7 +375,8 @@ def test_execute_operation_not_exposed(mock_ctx):
     data = json.loads(result.content)
     assert data["error"]["type"] == "OperationNotAllowed"
 
-def test_execute_validation_error(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_validation_error(mock_ctx):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -423,7 +385,7 @@ def test_execute_validation_error(mock_ctx):
         from aws_cli_mcp.utils.jsonschema import ValidationError
         mock_validate.return_value = [ValidationError(type="missing_required", message="Error 1")]
         
-        result = execute_operation({
+        result = await execute_operation({
             "action": "validate",
             "service": "s3",
             "operation": "ListBuckets",
@@ -432,7 +394,8 @@ def test_execute_validation_error(mock_ctx):
         data = json.loads(result.content)
         assert data["error"]["type"] == "ValidationError"
 
-def test_execute_policy_denied(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_policy_denied(mock_ctx):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -441,7 +404,7 @@ def test_execute_policy_denied(mock_ctx):
         mock_ctx.policy_engine.evaluate.return_value.allowed = False
         mock_ctx.policy_engine.evaluate.return_value.reasons = ["Denied"]
         
-        result = execute_operation({
+        result = await execute_operation({
             "action": "invoke",
             "service": "s3",
             "operation": "ListBuckets",
@@ -450,7 +413,8 @@ def test_execute_policy_denied(mock_ctx):
         data = json.loads(result.content)
         assert data["error"]["type"] == "PolicyDenied"
 
-def test_execute_type_coercion_error(mock_ctx):
+@pytest.mark.asyncio
+async def test_execute_type_coercion_error(mock_ctx):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -460,7 +424,7 @@ def test_execute_type_coercion_error(mock_ctx):
         mock_ctx.policy_engine.evaluate.return_value.require_approval = False
         
         with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", side_effect=ValueError("Coercion failed")):
-            result = execute_operation({
+            result = await execute_operation({
                 "action": "invoke",
                 "service": "s3",
                 "operation": "ListBuckets",
@@ -469,7 +433,8 @@ def test_execute_type_coercion_error(mock_ctx):
             data = json.loads(result.content)
             assert data["error"]["type"] == "TypeCoercionError"
 
-def test_execute_boto3_error_handling(mock_ctx, mock_sleep):
+@pytest.mark.asyncio
+async def test_execute_boto3_error_handling(mock_ctx, mock_sleep):
     mock_entry = MagicMock()
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
@@ -483,7 +448,7 @@ def test_execute_boto3_error_handling(mock_ctx, mock_sleep):
                 
                 # Case 1: Generic Exception
                 with patch("aws_cli_mcp.tools.aws_unified._call_boto3", side_effect=Exception("Generic Error")):
-                     result = execute_operation({
+                     result = await execute_operation({
                         "action": "invoke",
                         "service": "s3",
                         "operation": "ListBuckets",
@@ -500,7 +465,7 @@ def test_execute_boto3_error_handling(mock_ctx, mock_sleep):
                         ClientError({"Error": {"Code": "Throttling"}}, "op"),
                         {"Success": True}
                     ]
-                    result = execute_operation({
+                    result = await execute_operation({
                         "action": "invoke",
                         "service": "s3",
                         "operation": "ListBuckets",
