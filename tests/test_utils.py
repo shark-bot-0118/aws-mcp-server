@@ -1,7 +1,6 @@
 import socket
 from datetime import datetime, timezone
 from decimal import Decimal
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -158,6 +157,13 @@ def test_json_default_binary_fallback_paths():
     assert "BadIter" in rendered
 
 
+def test_json_default_decimal_precision_loss_returns_string() -> None:
+    value = Decimal("0.12345678901234567890123456789")
+    rendered = json_default(value)
+    assert rendered == str(value)
+    assert isinstance(rendered, str)
+
+
 def test_validate_payload_structured_required_multi_and_format_branch():
     from aws_cli_mcp.utils import jsonschema as mod
 
@@ -215,21 +221,9 @@ def test_normalize_public_base_url_validation_paths() -> None:
 
 
 def test_normalize_public_base_url_root_path_branch() -> None:
-    class FakePath:
-        def rstrip(self, _chars: str) -> str:
-            return "/"
-
-    fake_parsed = SimpleNamespace(
-        scheme="https",
-        netloc="example.com",
-        path=FakePath(),
-        query="",
-        fragment="",
-        username=None,
-        password=None,
-    )
-    with patch("aws_cli_mcp.utils.http.urlparse", return_value=fake_parsed):
-        assert normalize_public_base_url("https://example.com") == "https://example.com"
+    """Root path '/' should be stripped to produce a clean base URL."""
+    assert normalize_public_base_url("https://example.com/") == "https://example.com"
+    assert normalize_public_base_url("https://example.com") == "https://example.com"
 
 
 def test_validate_oidc_url_rejects_invalid_scheme_and_hostname() -> None:

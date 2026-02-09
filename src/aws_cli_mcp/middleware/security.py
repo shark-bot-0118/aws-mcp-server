@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -30,19 +30,19 @@ _SECURITY_EXEMPT_PATHS = frozenset(
 class BodySizeLimitExceeded(Exception):
     """Raised when request body exceeds size limit."""
 
-    pass
-
 
 @dataclass
 class RateLimitBucket:
-    """Sliding window rate limit bucket."""
+    """Sliding window rate limit bucket using a sorted deque for O(k) cleanup."""
 
-    timestamps: list[float] = field(default_factory=list)
+    timestamps: deque[float] = field(default_factory=deque)
 
     def cleanup(self, now: float, window_seconds: float) -> None:
-        """Cleanup timestamps outside of the active window."""
+        """Remove expired timestamps from the front of the deque (O(k) amortised)."""
         cutoff = now - window_seconds
-        self.timestamps = [t for t in self.timestamps if t > cutoff]
+        ts = self.timestamps
+        while ts and ts[0] <= cutoff:
+            ts.popleft()
 
     def add_request(self, now: float) -> None:
         self.timestamps.append(now)
@@ -50,29 +50,40 @@ class RateLimitBucket:
     def count(self) -> int:
         return len(self.timestamps)
 
+    def newest(self) -> float:
+        """Return the most recent timestamp. Assumes non-empty."""
+        return self.timestamps[-1]
+
 
 class SlidingWindowRateLimiter:
-    """Sliding window rate limiter."""
+    """Sliding window rate limiter with sharded locks for reduced contention."""
 
     _CLEANUP_INTERVAL: float = 60.0  # Run cleanup at most every 60 seconds
     _BUCKET_MAX_AGE: float = 300.0  # Remove buckets idle for 5 minutes
+    _NUM_SHARDS: int = 16
 
     def __init__(self) -> None:
         self._buckets: dict[str, RateLimitBucket] = defaultdict(RateLimitBucket)
         self._window_seconds: float = 60.0  # 1 minute window
-        self._lock = asyncio.Lock()
+        self._shard_locks = [asyncio.Lock() for _ in range(self._NUM_SHARDS)]
+        self._cleanup_lock = asyncio.Lock()
         self._last_cleanup: float = 0.0
+
+    def _shard_for(self, key: str) -> asyncio.Lock:
+        return self._shard_locks[hash(key) % self._NUM_SHARDS]
 
     async def allow(self, key: str, limit: int) -> bool:
         """Check if request is allowed under rate limit."""
-        async with self._lock:
-            now = time.time()
+        now = time.time()
 
-            # Periodic cleanup to prevent unbounded growth
-            if now - self._last_cleanup > self._CLEANUP_INTERVAL:
-                self._cleanup_old_buckets_unlocked(now)
-                self._last_cleanup = now
+        # Periodic cleanup (separate lock to avoid blocking hot path)
+        if now - self._last_cleanup > self._CLEANUP_INTERVAL:
+            async with self._cleanup_lock:
+                if now - self._last_cleanup > self._CLEANUP_INTERVAL:
+                    self._cleanup_old_buckets(now)
+                    self._last_cleanup = now
 
+        async with self._shard_for(key):
             bucket = self._buckets[key]
             bucket.cleanup(now, self._window_seconds)
 
@@ -82,13 +93,13 @@ class SlidingWindowRateLimiter:
             bucket.add_request(now)
             return True
 
-    def _cleanup_old_buckets_unlocked(self, now: float) -> None:
-        """Remove buckets with no recent activity. Must be called under lock."""
+    def _cleanup_old_buckets(self, now: float) -> None:
+        """Remove buckets with no recent activity."""
         cutoff = now - self._BUCKET_MAX_AGE
         keys_to_remove = [
             key
             for key, bucket in self._buckets.items()
-            if not bucket.timestamps or max(bucket.timestamps) < cutoff
+            if not bucket.timestamps or bucket.newest() < cutoff
         ]
         for key in keys_to_remove:
             del self._buckets[key]
@@ -196,10 +207,10 @@ class PreAuthSecurityMiddleware(BaseHTTPMiddleware):
                 logger.warning("Invalid Content-Length header: %r", content_length)
 
         transfer_encoding = request.headers.get("transfer-encoding", "").lower()
-        should_stream_check = "chunked" in transfer_encoding or request.method in (
-            "POST",
-            "PUT",
-            "PATCH",
+        content_length_is_zero = content_length is not None and content_length.strip() == "0"
+        should_stream_check = not content_length_is_zero and (
+            "chunked" in transfer_encoding
+            or request.method in ("POST", "PUT", "PATCH")
         )
         if should_stream_check:
             try:

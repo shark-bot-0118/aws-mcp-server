@@ -194,8 +194,13 @@ async def test_invalid_jsonrpc_method_type(mock_app):
 async def test_strict_mode_validations(mock_app):
     mock_app.state.strict_mcp_http = True
 
-    # Missing Accept
+    # Missing Accept is allowed (HTTP spec: missing means accept all)
     req = make_request(mock_app, json_body={})
+    resp = await handle_mcp_request(req)
+    assert resp.status_code != 406  # Should not be rejected
+
+    # Explicit non-JSON Accept should be rejected
+    req = make_request(mock_app, json_body={}, headers={"Accept": "text/html"})
     resp = await handle_mcp_request(req)
     assert resp.status_code == 406
 

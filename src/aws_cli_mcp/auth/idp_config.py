@@ -169,26 +169,31 @@ def _substitute_env_vars(value: str) -> str:
         var_name = match.group(1) or match.group(2)
         return os.environ.get(var_name, match.group(0))
 
-    # Match ${VAR} or $VAR patterns
-    pattern = r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+    # Match ${VAR} or $VAR patterns. Variable names restricted to safe identifiers.
+    pattern = r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
     return re.sub(pattern, replace, value)
 
 
-def _process_env_vars(obj: Any) -> Any:
+_MAX_ENV_VAR_DEPTH = 20
+
+
+def _process_env_vars(obj: Any, _depth: int = 0) -> Any:
     """Recursively substitute environment variables in strings."""
+    if _depth > _MAX_ENV_VAR_DEPTH:
+        return obj
     if isinstance(obj, str):
         return _substitute_env_vars(obj)
     elif isinstance(obj, dict):
-        return {k: _process_env_vars(v) for k, v in obj.items()}
+        return {k: _process_env_vars(v, _depth + 1) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [_process_env_vars(item) for item in obj]
+        return [_process_env_vars(item, _depth + 1) for item in obj]
     return obj
 
 
 def _project_root() -> Path:
     """Resolve project root by locating pyproject.toml."""
     current = Path(__file__).resolve()
-    for parent in (current.parent,) + tuple(current.parents):
+    for parent in current.parents:
         if (parent / "pyproject.toml").exists():
             return parent
     # Fallback: repo layout is /<root>/src/aws_cli_mcp/auth/idp_config.py

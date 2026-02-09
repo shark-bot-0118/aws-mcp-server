@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 
 from .context import RequestContext
 from .idp_config import RoleMappingEntry
 
 logger = logging.getLogger(__name__)
-
-_ROLE_ARN_RE = re.compile(r"^arn:aws(?:-cn|-us-gov)?:iam::\d{12}:role/[\w+=,.@/-]+$")
 
 
 @dataclass(frozen=True)
@@ -38,10 +35,7 @@ class RoleMapper:
         if not mappings:
             raise ValueError("At least one role mapping must be configured")
 
-        # Validate all role ARNs are properly formatted
-        for mapping in mappings:
-            if not _ROLE_ARN_RE.match(mapping.role_arn):
-                raise ValueError(f"Invalid role_arn format: {mapping.role_arn}")
+        # Role ARN format is already validated in RoleMappingEntry.__post_init__.
 
         # Warn about catch-all mappings (no user/group/claim constraints).
         for i, mapping in enumerate(mappings):
@@ -60,6 +54,11 @@ class RoleMapper:
                 )
 
         self._mappings = mappings
+        # Pre-compute lowered group sets for O(1) lookups.
+        self._mapping_groups: list[frozenset[str] | None] = [
+            frozenset(g.lower() for g in m.groups) if m.groups else None
+            for m in mappings
+        ]
         logger.info("RoleMapper initialized with %d mappings", len(mappings))
 
     def resolve(self, context: RequestContext) -> ResolvedRole | None:
@@ -69,8 +68,13 @@ class RoleMapper:
         Returns the first matching role or None if no match.
         This is an allowlist-only resolver - no dynamic generation.
         """
-        for mapping in self._mappings:
-            if self._matches(mapping, context):
+        # Pre-compute context groups once for all mappings.
+        context_groups_lower: frozenset[str] | None = None
+        if context.groups:
+            context_groups_lower = frozenset(g.lower() for g in context.groups)
+
+        for i, mapping in enumerate(self._mappings):
+            if self._matches(mapping, context, self._mapping_groups[i], context_groups_lower):
                 logger.debug(
                     "Role resolved for user %s: %s",
                     context.user_id,
@@ -85,7 +89,13 @@ class RoleMapper:
         logger.warning("No role mapping found for user %s", context.user_id)
         return None
 
-    def _matches(self, mapping: RoleMappingEntry, context: RequestContext) -> bool:
+    @staticmethod
+    def _matches(
+        mapping: RoleMappingEntry,
+        context: RequestContext,
+        mapping_groups_lower: frozenset[str] | None,
+        context_groups_lower: frozenset[str] | None,
+    ) -> bool:
         """Check if mapping matches context."""
         # user_id exact match (if specified)
         if mapping.user_id is not None:
@@ -101,27 +111,24 @@ class RoleMapper:
 
         # email_domain match (if specified)
         if mapping.email_domain is not None:
-            if not context.email:
+            if not context.email or "@" not in context.email:
                 return False
-            email_domain = context.email.split("@")[-1].lower()
+            email_domain = context.email.rsplit("@", 1)[1].lower()
             if mapping.email_domain.lower() != email_domain:
                 return False
 
         # groups match (any group matches, if specified)
-        # groups is optional in both mapping and context
-        if mapping.groups is not None:
-            if not context.groups:
+        if mapping_groups_lower is not None:
+            if not context_groups_lower:
                 return False
-            mapping_groups = set(g.lower() for g in mapping.groups)
-            context_groups = set(g.lower() for g in context.groups)
-            if not mapping_groups & context_groups:
+            if not mapping_groups_lower & context_groups_lower:
                 return False
 
         # custom claims match (all must match, if specified)
         if mapping.claims is not None:
             for key, expected_value in mapping.claims.items():
                 actual_value = context.raw_claims.get(key)
-                if actual_value != expected_value:
+                if str(actual_value) != expected_value:
                     return False
 
         return True

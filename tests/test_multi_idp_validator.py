@@ -805,9 +805,9 @@ class TestMultiIdPValidatorAdditionalCoverage:
         assert client._should_refresh() is True
 
         client._last_failure = datetime.now(timezone.utc)
-        assert await client._can_retry() is False
+        assert client._can_retry() is False
 
-        with patch.object(client, "_can_retry", new=AsyncMock(return_value=False)):
+        with patch.object(client, "_can_retry", return_value=False):
             await client._refresh_jwks(force=False)
 
         client2 = JWKSClient("https://jwks", JWKSCacheConfig(max_retries=1))

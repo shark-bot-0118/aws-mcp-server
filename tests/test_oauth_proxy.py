@@ -128,7 +128,8 @@ class TestOAuthProxyBroker:
         mock_client.created_at = time.time()  # Add created_at to avoid TypeError in comparison
         broker._clients[client_id] = mock_client
 
-        query = f"response_type=code&client_id={client_id}&redirect_uri=https://evil.com&state=state&code_challenge=cc&code_challenge_method=S256"
+        valid_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        query = f"response_type=code&client_id={client_id}&redirect_uri=https://evil.com&state=state&code_challenge={valid_challenge}&code_challenge_method=S256"
         scope = {
             "type": "http",
             "path": "/authorize",

@@ -11,6 +11,7 @@ fastmcp>=2.11.4
 
 # --- Dev / Test ---
 pytest
+pytest-asyncio>=0.24
 pytest-cov
 ruff
 mypy

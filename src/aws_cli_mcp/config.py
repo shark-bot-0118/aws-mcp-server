@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +12,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from aws_cli_mcp.utils.http import normalize_public_base_url
+
+_config_logger = logging.getLogger(__name__)
 
 
 class LoggingSettings(BaseModel):
@@ -182,9 +185,7 @@ def _resolve_path(path: str) -> str:
         resolved = candidate.resolve()
     else:
         resolved = (root / candidate).resolve()
-    # Allow paths under project root or under the project's data directory
-    root_str = str(root)
-    if not (str(resolved).startswith(root_str + os.sep) or resolved == root):
+    if not resolved.is_relative_to(root):
         raise ValueError(f"Path traversal detected: '{path}' resolves outside project root")
     return str(resolved)
 
@@ -203,9 +204,7 @@ def _env_int(key: str, default: int) -> int:
     try:
         return int(value)
     except ValueError:
-        import logging
-
-        logging.getLogger(__name__).warning(
+        _config_logger.warning(
             "Invalid integer value for %s: %r, using default %d", key, value, default
         )
         return default
@@ -218,9 +217,7 @@ def _env_float(key: str, default: float) -> float:
     try:
         return float(value)
     except ValueError:
-        import logging
-
-        logging.getLogger(__name__).warning(
+        _config_logger.warning(
             "Invalid float value for %s: %r, using default %s", key, value, default
         )
         return default

@@ -35,18 +35,12 @@ class TestRoleMapperInitialization:
             RoleMapper([])
 
     def test_validates_role_arn_format(self) -> None:
-        """RoleMapper should validate role ARN format."""
-        invalid_mapping = object.__new__(RoleMappingEntry)
-        object.__setattr__(invalid_mapping, "account_id", "111111111111")
-        object.__setattr__(invalid_mapping, "role_arn", "invalid-arn")
-        object.__setattr__(invalid_mapping, "user_id", None)
-        object.__setattr__(invalid_mapping, "email", None)
-        object.__setattr__(invalid_mapping, "email_domain", None)
-        object.__setattr__(invalid_mapping, "groups", None)
-        object.__setattr__(invalid_mapping, "claims", None)
-
+        """RoleMappingEntry should validate role ARN format at construction."""
         with pytest.raises(ValueError, match="Invalid role_arn"):
-            RoleMapper([invalid_mapping])
+            RoleMappingEntry(
+                account_id="111111111111",
+                role_arn="invalid-arn",
+            )
 
     def test_valid_initialization(self) -> None:
         """RoleMapper should initialize with valid mappings."""

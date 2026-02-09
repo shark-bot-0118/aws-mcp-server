@@ -5,6 +5,8 @@ Provides centralized model version tracking, caching, and schema resolution.
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -80,8 +82,9 @@ class VersionManager:
         self._model_path = model_path
         self._service_allowlist = service_allowlist or []
         self._max_cached_versions = max_cached_versions
-        self._snapshots: dict[str, ModelSnapshot] = {}
+        self._snapshots: OrderedDict[str, ModelSnapshot] = OrderedDict()
         self._current_version: str | None = None
+        self._lock = threading.Lock()
 
     def get_current_version(self) -> str | None:
         """Get the current model version (git commit SHA).
@@ -107,11 +110,20 @@ class VersionManager:
         if version is None:
             version = self.get_current_version() or "latest"
 
-        if version in self._snapshots:
-            return self._snapshots[version]
+        with self._lock:
+            if version in self._snapshots:
+                self._snapshots.move_to_end(version)
+                return self._snapshots[version]
 
+        # Build snapshot outside the lock (I/O-heavy)
         snapshot = self._create_snapshot(version)
-        self._cache_snapshot(version, snapshot)
+
+        with self._lock:
+            # Double-check: another thread may have loaded this version
+            if version in self._snapshots:
+                self._snapshots.move_to_end(version)
+                return self._snapshots[version]
+            self._cache_snapshot(version, snapshot)
         return snapshot
 
     def resolve_schema(
@@ -184,14 +196,14 @@ class VersionManager:
         return load_models(self._model_path)
 
     def _cache_snapshot(self, version: str, snapshot: ModelSnapshot) -> None:
-        """Cache a snapshot with LRU eviction."""
-        if len(self._snapshots) >= self._max_cached_versions:
-            oldest_key = next(iter(self._snapshots))
-            del self._snapshots[oldest_key]
+        """Cache a snapshot with LRU eviction. Must be called under self._lock."""
+        while len(self._snapshots) >= self._max_cached_versions:
+            self._snapshots.popitem(last=False)  # evict LRU (oldest-accessed)
         self._snapshots[version] = snapshot
 
 
 _version_manager: VersionManager | None = None
+_version_manager_lock = threading.Lock()
 
 
 def get_version_manager() -> VersionManager:
@@ -199,9 +211,10 @@ def get_version_manager() -> VersionManager:
 
     This is lazily initialized when first called via init_version_manager().
     """
-    if _version_manager is None:
+    mgr = _version_manager
+    if mgr is None:
         raise RuntimeError("Version manager not initialized. Call init_version_manager() first.")
-    return _version_manager
+    return mgr
 
 
 def init_version_manager(
@@ -222,13 +235,14 @@ def init_version_manager(
         The initialized VersionManager instance.
     """
     global _version_manager
-    _version_manager = VersionManager(
-        cache_path=cache_path,
-        model_path=model_path,
-        service_allowlist=service_allowlist,
-        max_cached_versions=max_cached_versions,
-    )
-    return _version_manager
+    with _version_manager_lock:
+        _version_manager = VersionManager(
+            cache_path=cache_path,
+            model_path=model_path,
+            service_allowlist=service_allowlist,
+            max_cached_versions=max_cached_versions,
+        )
+        return _version_manager
 
 
 def get_model_version() -> str | None:

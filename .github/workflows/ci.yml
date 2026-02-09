@@ -37,6 +37,7 @@ jobs:
     name: Quality
     runs-on: ubuntu-latest
     needs: test
+    if: ${{ always() }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,6 +63,7 @@ jobs:
     name: SCA
     runs-on: ubuntu-latest
     needs: test
+    if: ${{ always() }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

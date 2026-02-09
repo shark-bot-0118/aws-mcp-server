@@ -130,6 +130,11 @@ def test_substitute_and_process_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
     assert processed["x"][1]["y"] == "${MISSING}"
 
 
+def test_process_env_vars_stops_when_depth_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_VAR", "value-1")
+    assert _process_env_vars("$TEST_VAR", _depth=21) == "$TEST_VAR"
+
+
 def test_project_root_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Path, "exists", lambda self: False)
     root = _project_root()

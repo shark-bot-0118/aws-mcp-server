@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -14,6 +15,8 @@ from aws_cli_mcp.execution.aws_client import RequestContextError
 from aws_cli_mcp.mcp_runtime import ToolResult
 from aws_cli_mcp.tools import get_tool_registry
 from aws_cli_mcp.utils.serialization import json_default
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
@@ -193,9 +196,7 @@ async def _handle_single(
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).exception("Tool handler error: %s", name)
+            logger.exception("Tool handler error: %s", name)
             return _error_body(request_id, "Internal tool error")
 
         return {
@@ -281,6 +282,8 @@ def _validate_protocol_version(request: Request) -> JSONResponse | None:
 
 def _validate_accept_header(request: Request) -> JSONResponse | None:
     accept = request.headers.get("accept", "")
+    if not accept:
+        return None  # Missing Accept header means client accepts any media type
     tokens = [part.split(";", 1)[0].strip().lower() for part in accept.split(",")]
     if "*/*" in tokens:
         return None

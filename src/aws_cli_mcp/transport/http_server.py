@@ -42,6 +42,57 @@ _BASE_EXEMPT_PATHS = frozenset(
 )
 
 
+async def _mcp_handler(request: Request) -> Response:
+    from aws_cli_mcp.transport.mcp_handler import handle_mcp_request
+
+    return await handle_mcp_request(request)
+
+
+async def _health_handler(request: Request) -> Response:
+    return JSONResponse({"status": "healthy"})
+
+
+async def _ready_handler(request: Request) -> Response:
+    return JSONResponse({"status": "ready"})
+
+
+def _base_routes() -> list[Route]:
+    """Common routes shared by all auth modes."""
+    return [
+        Route("/mcp", endpoint=_mcp_handler, methods=["POST", "OPTIONS"]),
+        Route("/health", endpoint=_health_handler, methods=["GET"]),
+        Route("/ready", endpoint=_ready_handler, methods=["GET"]),
+    ]
+
+
+def _add_cors_middleware(middleware: list[Middleware], settings: Any) -> None:
+    """Add CORS middleware if configured. Must be outermost (list head)."""
+    if settings.server.http_enable_cors and settings.server.http_allowed_origins:
+        from starlette.middleware.cors import CORSMiddleware
+
+        middleware.insert(
+            0,
+            Middleware(
+                CORSMiddleware,
+                allow_origins=list(settings.server.http_allowed_origins),
+                allow_methods=["POST", "GET", "OPTIONS"],
+                allow_headers=[
+                    "Authorization",
+                    "Content-Type",
+                    "Accept",
+                    "MCP-Protocol-Version",
+                ],
+            ),
+        )
+
+
+def _configure_app_state(app: Starlette, settings: Any) -> None:
+    """Set common app state shared by all auth modes."""
+    app.state.strict_mcp_http = settings.server.transport_mode == "remote"
+    app.state.http_allowed_origins = tuple(settings.server.http_allowed_origins)
+    app.state.http_allow_missing_origin = settings.server.http_allow_missing_origin
+
+
 def create_http_app() -> Starlette:
     """Create the HTTP MCP server application."""
     settings = load_settings()
@@ -164,54 +215,23 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
         ),
     ]
 
-    # Add CORS if configured — MUST be outermost (list head) so that
-    # OPTIONS preflight requests receive CORS headers before any auth
-    # middleware can reject them with 401.
-    if settings.server.http_enable_cors and settings.server.http_allowed_origins:
-        from starlette.middleware.cors import CORSMiddleware
+    _add_cors_middleware(middleware, settings)
 
-        middleware.insert(
-            0,
-            Middleware(
-                CORSMiddleware,
-                allow_origins=list(settings.server.http_allowed_origins),
-                allow_methods=["POST", "GET", "OPTIONS"],
-                allow_headers=[
-                    "Authorization",
-                    "Content-Type",
-                    "Accept",
-                    "MCP-Protocol-Version",
-                ],
+    routes = _base_routes()
+    routes.extend(
+        [
+            Route(
+                "/.well-known/oauth-protected-resource",
+                endpoint=protected_resource_endpoint.handle,
+                methods=["GET"],
             ),
-        )
-
-    # Route handlers
-    async def mcp_handler(request: Request) -> Response:
-        from aws_cli_mcp.transport.mcp_handler import handle_mcp_request
-
-        return await handle_mcp_request(request)
-
-    async def health_handler(request: Request) -> Response:
-        return JSONResponse({"status": "healthy"})
-
-    async def ready_handler(request: Request) -> Response:
-        return JSONResponse({"status": "ready"})
-
-    routes = [
-        Route("/mcp", endpoint=mcp_handler, methods=["POST", "OPTIONS"]),
-        Route("/health", endpoint=health_handler, methods=["GET"]),
-        Route("/ready", endpoint=ready_handler, methods=["GET"]),
-        Route(
-            "/.well-known/oauth-protected-resource",
-            endpoint=protected_resource_endpoint.handle,
-            methods=["GET"],
-        ),
-        Route(
-            "/.well-known/oauth-protected-resource/mcp",
-            endpoint=protected_resource_endpoint.handle,
-            methods=["GET"],
-        ),
-    ]
+            Route(
+                "/.well-known/oauth-protected-resource/mcp",
+                endpoint=protected_resource_endpoint.handle,
+                methods=["GET"],
+            ),
+        ]
+    )
 
     if oauth_proxy:
         routes.extend(
@@ -262,9 +282,7 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
         middleware=middleware,
         lifespan=lifespan,
     )
-    app.state.strict_mcp_http = settings.server.transport_mode == "remote"
-    app.state.http_allowed_origins = tuple(settings.server.http_allowed_origins)
-    app.state.http_allow_missing_origin = settings.server.http_allow_missing_origin
+    _configure_app_state(app, settings)
     return app
 
 
@@ -306,48 +324,13 @@ def _create_identity_center_app(settings: Any) -> Starlette:
         ),
     ]
 
-    if settings.server.http_enable_cors and settings.server.http_allowed_origins:
-        from starlette.middleware.cors import CORSMiddleware
-
-        middleware.insert(
-            0,
-            Middleware(
-                CORSMiddleware,
-                allow_origins=list(settings.server.http_allowed_origins),
-                allow_methods=["POST", "GET", "OPTIONS"],
-                allow_headers=[
-                    "Authorization",
-                    "Content-Type",
-                    "Accept",
-                    "MCP-Protocol-Version",
-                ],
-            ),
-        )
-
-    async def mcp_handler(request: Request) -> Response:
-        from aws_cli_mcp.transport.mcp_handler import handle_mcp_request
-
-        return await handle_mcp_request(request)
-
-    async def health_handler(request: Request) -> Response:
-        return JSONResponse({"status": "healthy"})
-
-    async def ready_handler(request: Request) -> Response:
-        return JSONResponse({"status": "ready"})
-
-    routes = [
-        Route("/mcp", endpoint=mcp_handler, methods=["POST", "OPTIONS"]),
-        Route("/health", endpoint=health_handler, methods=["GET"]),
-        Route("/ready", endpoint=ready_handler, methods=["GET"]),
-    ]
+    _add_cors_middleware(middleware, settings)
 
     app = Starlette(
-        routes=routes,
+        routes=_base_routes(),
         middleware=middleware,
     )
-    app.state.strict_mcp_http = settings.server.transport_mode == "remote"
-    app.state.http_allowed_origins = tuple(settings.server.http_allowed_origins)
-    app.state.http_allow_missing_origin = settings.server.http_allow_missing_origin
+    _configure_app_state(app, settings)
     return app
 
 

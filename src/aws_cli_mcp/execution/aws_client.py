@@ -43,9 +43,19 @@ def _get_cached_client(
                 return client
             # TTL expired — remove stale entry
             del _CLIENT_CACHE[key]
-        client = build_client()
+
+    # Build client OUTSIDE the lock to avoid blocking all concurrent callers.
+    client = build_client()
+
+    with _CLIENT_CACHE_LOCK:
+        # Double-check: another thread may have built the same client.
+        cached = _CLIENT_CACHE.get(key)
+        if cached is not None:
+            _, created_at = cached
+            if now - created_at < _CLIENT_TTL_SECONDS:
+                _CLIENT_CACHE.move_to_end(key)
+                return cached[0]
         _CLIENT_CACHE[key] = (client, now)
-        # Evict LRU entries if cache exceeds max size
         while len(_CLIENT_CACHE) > _CLIENT_CACHE_MAX_SIZE:
             _CLIENT_CACHE.popitem(last=False)
         return client
@@ -213,6 +223,13 @@ def _read_streaming_fields(
                 "Failed to read streaming field '%s': %s", key, exc
             )
             response[key] = "<Error reading stream>"
+        finally:
+            # Close the streaming body to release HTTP connections.
+            if hasattr(obj, "close") and callable(obj.close):
+                try:
+                    obj.close()
+                except Exception:
+                    pass
 
 
 def _call_method(

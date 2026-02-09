@@ -227,6 +227,21 @@ def test_get_client_lru_eviction_when_cache_limit_exceeded(
     assert remaining_key[1] == "ec2"
 
 
+def test_get_cached_client_double_checked_branch_prefers_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = ("profile", "s3", "us-east-1", "default")
+    cached_client = object()
+    newly_built_client = object()
+
+    monkeypatch.setattr(aws_client.time, "monotonic", lambda: 100.0)
+
+    def build_client() -> object:
+        aws_client._CLIENT_CACHE[key] = (cached_client, 100.0)
+        return newly_built_client
+
+    resolved = aws_client._get_cached_client(key, build_client)
+    assert resolved is cached_client
+
+
 @patch("aws_cli_mcp.execution.aws_client.load_settings")
 @patch("aws_cli_mcp.execution.aws_client.Config")
 @patch("aws_cli_mcp.execution.aws_client.boto3.Session")
@@ -305,6 +320,19 @@ def test_read_streaming_fields_non_stream_object_and_truncation() -> None:
     _read_streaming_fields(response, max_output_characters=5)
     assert response["Body"] == "already text"
     assert response["Payload"] == "hello"
+
+
+def test_read_streaming_fields_ignores_close_exceptions() -> None:
+    class _CloseErrorStream:
+        def read(self, size: int | None = None) -> bytes:
+            return b"abc"
+
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    response = {"Body": _CloseErrorStream()}
+    _read_streaming_fields(response, max_output_characters=10)
+    assert response["Body"] == "abc"
 
 
 def test_truncate_text_short_and_long() -> None:

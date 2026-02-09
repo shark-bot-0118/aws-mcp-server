@@ -71,7 +71,7 @@ class JWKSClient:
                 for key in self._jwks_data.get("keys", []):
                     if key.get("kid") == kid:
                         return self._jwk_to_key(key)
-            raise TokenValidationError(f"Key with kid '{kid}' not found", "key_not_found")
+            raise TokenValidationError("Signing key not found", "key_not_found")
 
         # No kid specified, use first key
         return self._jwk_to_key(keys[0])
@@ -115,7 +115,7 @@ class JWKSClient:
         threshold = self.config.ttl_seconds - self.config.refresh_before_seconds
         return age >= threshold
 
-    async def _can_retry(self) -> bool:
+    def _can_retry(self) -> bool:
         """Check if we can retry after failure."""
         if self._last_failure is None:
             return True
@@ -126,7 +126,7 @@ class JWKSClient:
 
     async def _refresh_jwks(self, force: bool = False) -> None:
         """Refresh JWKS from remote."""
-        if not force and not await self._can_retry():
+        if not force and not self._can_retry():
             logger.debug("JWKS refresh skipped (backoff)")
             return
 

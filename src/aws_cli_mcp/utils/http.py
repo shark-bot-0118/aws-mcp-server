@@ -74,8 +74,6 @@ def normalize_public_base_url(value: str) -> str:
         raise ValueError("public_base_url must not include userinfo")
 
     normalized_path = parsed.path.rstrip("/")
-    if normalized_path == "/":
-        normalized_path = ""
     return f"{parsed.scheme.lower()}://{parsed.netloc}{normalized_path}"
 
 

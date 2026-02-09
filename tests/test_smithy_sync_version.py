@@ -1,3 +1,4 @@
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -5,7 +6,7 @@ import pytest
 from aws_cli_mcp.config import SmithySettings
 from aws_cli_mcp.domain.operations import OperationRef
 from aws_cli_mcp.smithy.catalog import OperationEntry
-from aws_cli_mcp.smithy.sync import get_model_commit_sha, sync_models
+from aws_cli_mcp.smithy.sync import _run, get_model_commit_sha, sync_models
 from aws_cli_mcp.smithy.version_manager import (
     ModelSnapshot,
     get_model_version,
@@ -128,6 +129,15 @@ def test_get_model_commit_sha_handles_exception(mock_run, tmp_path):
     repo_path = tmp_path / "api-models-aws"
     (repo_path / ".git").mkdir(parents=True)
     assert get_model_commit_sha(str(tmp_path)) is None
+
+
+@patch(
+    "aws_cli_mcp.smithy.sync.subprocess.run",
+    side_effect=subprocess.TimeoutExpired(cmd="git fetch", timeout=1),
+)
+def test_run_raises_on_timeout(mock_run):
+    with pytest.raises(RuntimeError, match="git fetch timed out after"):
+        _run(["git", "fetch"])
 
 
 @patch("aws_cli_mcp.smithy.sync.subprocess.run")
@@ -335,3 +345,26 @@ def test_version_manager_create_snapshot_builds_services(
     snap = vm.load_snapshot("vX")
     assert "s3" in snap.services
     assert "ListBuckets" in snap.services["s3"].operations
+
+
+def test_version_manager_load_snapshot_double_checked_branch(clean_vm):
+    vm = init_version_manager("cache", "path", max_cached_versions=2)
+
+    existing = ModelSnapshot(version="v1", loaded_at="existing")
+    existing._model = MagicMock()
+    existing._catalog = MagicMock()
+    existing._schema_generator = MagicMock()
+
+    new_snapshot = ModelSnapshot(version="v1", loaded_at="new")
+    new_snapshot._model = MagicMock()
+    new_snapshot._catalog = MagicMock()
+    new_snapshot._schema_generator = MagicMock()
+
+    def create_and_simulate_race(version: str) -> ModelSnapshot:
+        vm._snapshots[version] = existing
+        return new_snapshot
+
+    with patch.object(vm, "_create_snapshot", side_effect=create_and_simulate_race):
+        resolved = vm.load_snapshot("v1")
+
+    assert resolved is existing

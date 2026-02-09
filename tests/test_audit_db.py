@@ -154,3 +154,11 @@ def test_wal_mode(tmp_path):
     assert row[0].upper() == "WAL"
     store.close()
     store.close()
+
+
+def test_store_raises_after_close(tmp_path):
+    store = SqliteStore(str(tmp_path / "closed.db"))
+    store.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        store.fetch_one("SELECT 1", ())

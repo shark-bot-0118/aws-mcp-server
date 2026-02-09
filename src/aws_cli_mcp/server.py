@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -57,7 +58,7 @@ def _run_http() -> None:
 
     try:
         import uvicorn
-    except Exception as exc:
+    except ImportError as exc:
         raise RuntimeError("uvicorn is required for HTTP transport mode") from exc
 
     app = create_http_app()
@@ -72,6 +73,7 @@ def _run_http() -> None:
 
 
 _server: MCPServer | None = None
+_server_lock = threading.Lock()
 
 
 def get_server() -> MCPServer:
@@ -82,9 +84,12 @@ def get_server() -> MCPServer:
     testability and avoids circular-import risks.
     """
     global _server
-    if _server is None:
-        _server = build_server()
-    return _server
+    if _server is not None:
+        return _server
+    with _server_lock:
+        if _server is None:
+            _server = build_server()
+        return _server
 
 
 # Keep for backward compatibility – tests import this.
@@ -92,7 +97,7 @@ def _module_init() -> MCPServer | None:
     _settings = load_settings()
     if _is_http_transport(_settings.server.transport_mode):
         return None
-    return build_server()
+    return get_server()
 
 
 if __name__ == "__main__":  # pragma: no cover

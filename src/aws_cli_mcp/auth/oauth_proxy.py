@@ -292,18 +292,7 @@ class OAuthProxyBroker:
         if redirect_error:
             return self._oauth_error("invalid_request", redirect_error)
 
-        async with self._state_lock:
-            self._cleanup_expired()
-
-            if self._clients.get(client_id):
-                if not self._is_registered_redirect_uri(client_id, redirect_uri):
-                    return self._oauth_error("invalid_request", "redirect_uri is not registered")
-            elif not self._is_loopback_redirect_uri(redirect_uri):
-                return self._oauth_error(
-                    "invalid_request",
-                    "unregistered clients must use localhost loopback redirect_uri",
-                )
-
+        # Validate PKCE parameters before acquiring the state lock.
         code_challenge = (qp.get("code_challenge") or "").strip() or None
         code_challenge_method = (qp.get("code_challenge_method") or "S256").strip()
         if not code_challenge:
@@ -320,6 +309,17 @@ class OAuthProxyBroker:
             return self._oauth_error("invalid_request", "code_challenge format is invalid")
 
         async with self._state_lock:
+            self._cleanup_expired()
+
+            if self._clients.get(client_id):
+                if not self._is_registered_redirect_uri(client_id, redirect_uri):
+                    return self._oauth_error("invalid_request", "redirect_uri is not registered")
+            elif not self._is_loopback_redirect_uri(redirect_uri):
+                return self._oauth_error(
+                    "invalid_request",
+                    "unregistered clients must use localhost loopback redirect_uri",
+                )
+
             if not self._has_capacity(len(self._transactions), _MAX_TRANSACTIONS):
                 return self._oauth_error(
                     "temporarily_unavailable",
@@ -370,10 +370,15 @@ class OAuthProxyBroker:
             return self._oauth_error("invalid_request", "OAuth transaction not found", 400)
 
         if qp.get("error"):
+            # Sanitize upstream error values to prevent reflected content injection.
+            raw_error = (qp.get("error") or "")[:64]
+            raw_desc = (qp.get("error_description") or "")[:256]
+            safe_error = "".join(c for c in raw_error if c.isalnum() or c in "_- ")
+            safe_desc = "".join(c for c in raw_desc if 0x20 <= ord(c) < 0x7F)
             params = urlencode(
                 {
-                    "error": qp.get("error"),
-                    "error_description": qp.get("error_description", ""),
+                    "error": safe_error,
+                    "error_description": safe_desc,
                     "state": transaction.original_state,
                 }
             )
@@ -507,9 +512,12 @@ class OAuthProxyBroker:
                     return self._oauth_error("invalid_client", "client_id mismatch", 401)
                 if redirect_uri != record.redirect_uri:
                     return self._oauth_error("invalid_grant", "redirect_uri mismatch")
-                # Mark consumed after validation passes.
+                # Verify PKCE before consuming code so failed verification
+                # doesn't permanently invalidate a legitimate code.
+                if not self._verify_pkce(record, code_verifier):
+                    return self._oauth_error("invalid_grant", "PKCE verification failed")
+                # Mark consumed after all validation passes.
                 record.consumed = True
-            async with self._state_lock:
                 registration = self._clients.get(client_id)
             if registration and registration.token_endpoint_auth_method == "client_secret_post":
                 provided_secret = form_get("client_secret").strip()
@@ -518,8 +526,6 @@ class OAuthProxyBroker:
                     provided_secret, expected_secret
                 ):
                     return self._oauth_error("invalid_client", "client_secret mismatch", 401)
-            if not self._verify_pkce(record, code_verifier):
-                return self._oauth_error("invalid_grant", "PKCE verification failed")
 
             payload = _filter_token_response(record.token_response)
             payload.setdefault("token_type", "Bearer")

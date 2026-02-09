@@ -15,6 +15,7 @@ from aws_cli_mcp.auth.idp_config import SecurityConfig
 from aws_cli_mcp.middleware.security import (
     BodySizeLimitExceeded,
     PreAuthSecurityMiddleware,
+    RateLimitBucket,
     SlidingWindowRateLimiter,
     UserRateLimitMiddleware,
     get_client_ip,
@@ -78,15 +79,25 @@ class TestSlidingWindowRateLimiter:
 
     @pytest.mark.asyncio
     async def test_cleanup_old_buckets_removes_idle_keys(self) -> None:
+        from collections import deque
+
         limiter = SlidingWindowRateLimiter()
         now = 1000.0
-        limiter._buckets["old"].timestamps = [1.0]
-        limiter._buckets["empty"].timestamps = []
-        limiter._buckets["new"].timestamps = [990.0]
-        limiter._cleanup_old_buckets_unlocked(now)
+        limiter._buckets["old"].timestamps = deque([1.0])
+        limiter._buckets["empty"].timestamps = deque()
+        limiter._buckets["new"].timestamps = deque([990.0])
+        limiter._cleanup_old_buckets(now)
         assert "old" not in limiter._buckets
         assert "empty" not in limiter._buckets
         assert "new" in limiter._buckets
+
+    def test_rate_limit_bucket_cleanup_removes_expired_timestamps(self) -> None:
+        bucket = RateLimitBucket()
+        bucket.timestamps.extend([1.0, 100.0])
+
+        bucket.cleanup(now=61.0, window_seconds=60.0)
+
+        assert list(bucket.timestamps) == [100.0]
 
 
 class TestGetClientIp:

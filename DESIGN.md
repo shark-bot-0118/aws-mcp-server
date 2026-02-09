@@ -2,7 +2,7 @@
 
 ## Meta
 - **Project Title:** AWS Tool-Execution MCP Server
-- **Version:** 3.18
+- **Version:** 3.19
 - **Last Updated:** 2026-02-09
 - **Document Role:** Architecture / design SSOT
 - **History & Versioning:** `/Users/shuto/Projects/mcp_server/aws_cli_v2/HISTORY.md`
@@ -101,7 +101,7 @@ src/aws_cli_mcp/
 - starlette >= 0.37
 - uvicorn >= 0.29
 - SQLite (builtin)
-- pytest, ruff (dev)
+- pytest, pytest-asyncio, pytest-cov, ruff, mypy, pip-audit (dev)
 
 ### Pattern
 - Clean Architecture with explicit domain models and adapters (MCP layer vs AWS execution).
@@ -698,6 +698,10 @@ Validate and invoke AWS operations.
   - hard gate: `ruff check src tests`
   - hard gate: `mypy src/aws_cli_mcp`
   - hard gate: `pip-audit --progress-spinner off`
+- CI observability policy:
+  - `quality` and `sca` jobs must run even when `test` fails, so static-analysis/security results are never hidden by upstream skips.
+- Pytest async policy:
+  - `pytest-asyncio` is a required dev dependency because pytest config uses async loop-scope options.
 - Optional advisory jobs may exist for experiments, but merge safety must not depend on runtime flags.
 - Local SCA verification should run with the project virtualenv binary
   (`.venv/bin/pip-audit --progress-spinner off`) to avoid host PATH drift.

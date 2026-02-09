@@ -123,12 +123,17 @@ class SqliteStore:
         )
         self._conn.commit()
 
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("SqliteStore is closed")
+
     def execute(
         self,
         query: str,
         params: _SqlParams,
     ) -> None:
         with self._lock:
+            self._check_open()
             self._conn.execute(query, params)
             self._conn.commit()
 
@@ -145,6 +150,7 @@ class SqliteStore:
         params: _SqlParams,
     ) -> sqlite3.Row | None:
         with self._lock:
+            self._check_open()
             cur = self._conn.execute(query, params)
             return cur.fetchone()
 

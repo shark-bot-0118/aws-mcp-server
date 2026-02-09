@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Callable
@@ -96,21 +96,11 @@ class RequestContext:
         role_arn: str,
     ) -> "RequestContext":
         """Return new context with AWS credentials."""
-        return RequestContext(
-            user_id=self.user_id,
-            email=self.email,
-            groups=self.groups,
-            issuer=self.issuer,
-            token_expiry=self.token_expiry,
-            token_jti=self.token_jti,
-            request_id=self.request_id,
-            received_at=self.received_at,
-            access_token=self.access_token,
-            id_token=self.id_token,
+        return replace(
+            self,
             aws_credentials=creds,
             aws_account_id=account_id,
             aws_role_arn=role_arn,
-            raw_claims=self.raw_claims,
         )
 
 
