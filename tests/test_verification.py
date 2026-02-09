@@ -1,34 +1,42 @@
 """Tests for AWS MCP Server v2 (3-tool architecture)."""
 
-import sys
 import logging
-import unittest
-from unittest.mock import patch
-from io import StringIO
-
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
+import sys
+import unittest
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from aws_cli_mcp.logging_utils import configure_logging
-from aws_cli_mcp.policy.models import PolicyConfig, RequiredTag, PolicyRules, PolicyDefaults, ApprovalSettings, ServicePolicy
-from aws_cli_mcp.policy.engine import PolicyEngine
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
+
+from aws_cli_mcp.config import LoggingSettings, Settings
 from aws_cli_mcp.domain.operations import OperationRef
-
+from aws_cli_mcp.logging_utils import configure_logging
+from aws_cli_mcp.policy.engine import PolicyEngine
+from aws_cli_mcp.policy.models import (
+    ApprovalSettings,
+    PolicyConfig,
+    PolicyDefaults,
+    PolicyRules,
+    RequiredTag,
+    ServicePolicy,
+)
 from aws_cli_mcp.utils.jsonschema import (
+    ValidationError,
+    format_structured_errors,
     validate_payload,
     validate_payload_structured,
-    format_structured_errors,
-    ValidationError,
 )
 
 
 class TestLogging(unittest.TestCase):
-
     def test_logging_to_stderr(self):
         """Verify logging goes to stderr."""
         logging.root.handlers = []
 
-        with patch('sys.stderr', new=StringIO()) as fake_stderr:
+        with patch("sys.stderr", new=StringIO()) as fake_stderr:
             configure_logging()
             logging.info("Test log message")
 
@@ -36,9 +44,23 @@ class TestLogging(unittest.TestCase):
             self.assertIn("Test log message", output)
             self.assertIn("INFO", output)
 
+    def test_logging_file_creates_parent_directory(self):
+        """Verify LOG_FILE parent directory is created automatically."""
+        logging.root.handlers = []
+
+        with TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "nested" / "server.log"
+            settings = Settings(logging=LoggingSettings(file=str(log_path)))
+
+            with patch("aws_cli_mcp.logging_utils.load_settings", return_value=settings):
+                configure_logging()
+
+            self.assertTrue(log_path.parent.exists())
+            self.assertTrue(log_path.exists())
+            logging.shutdown()
+
 
 class TestPolicyEngine(unittest.TestCase):
-
     def test_policy_relaxed_tags_for_reads(self):
         """Verify required_tags are relaxed for operations without tags (reads)."""
         config = PolicyConfig(
@@ -49,7 +71,7 @@ class TestPolicyEngine(unittest.TestCase):
             destructive_patterns=[],
             risk_patterns={},
             required_tags=[RequiredTag(key="Owner", pattern=".+")],
-            approval=ApprovalSettings()
+            approval=ApprovalSettings(),
         )
         engine = PolicyEngine(config)
 
@@ -70,14 +92,12 @@ class TestPolicyEngine(unittest.TestCase):
             destructive_patterns=[],
             risk_patterns={},
             required_tags=[RequiredTag(key="Owner", pattern=".+")],
-            approval=ApprovalSettings()
+            approval=ApprovalSettings(),
         )
         engine = PolicyEngine(config)
 
         op = OperationRef(service="ec2", operation="RunInstances")
-        params = {
-            "Tags": [{"Key": "WrongKey", "Value": "Val"}]
-        }
+        params = {"Tags": [{"Key": "WrongKey", "Value": "Val"}]}
 
         decision = engine.evaluate(op, params)
         self.assertFalse(decision.allowed, "Operation with wrong tags should be denied")
@@ -93,7 +113,7 @@ class TestPolicyEngine(unittest.TestCase):
             destructive_patterns=[],
             risk_patterns={},
             required_tags=[],
-            approval=ApprovalSettings()
+            approval=ApprovalSettings(),
         )
         engine = PolicyEngine(config)
 
@@ -105,7 +125,6 @@ class TestPolicyEngine(unittest.TestCase):
 
 
 class TestStructuredValidation(unittest.TestCase):
-
     def test_missing_required_field(self):
         """Verify structured validation detects missing required fields."""
         schema = {
@@ -185,7 +204,6 @@ class TestStructuredValidation(unittest.TestCase):
 
 
 class TestToolSchemas(unittest.TestCase):
-
     def test_search_schema_validation(self):
         """Verify aws_search_operations input validation."""
         from aws_cli_mcp.tools.aws_unified import SEARCH_SCHEMA
@@ -233,5 +251,5 @@ class TestToolSchemas(unittest.TestCase):
         self.assertNotEqual(errors, [])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

@@ -81,4 +81,4 @@ class PolicyConfig(BaseModel):
 
     @classmethod
     def from_yaml(cls, data: dict[str, object]) -> "PolicyConfig":
-        return cls(**data)
+        return cls.model_validate(data)

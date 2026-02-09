@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from aws_cli_mcp.config import SmithySettings
+
+# Only allow safe git ref names (branches, tags, SHAs).
+_SAFE_REF_RE = re.compile(r"^[a-zA-Z0-9._/+-]+$")
+
+# Only allow HTTPS URLs for git sync (prevents file://, ssh://, etc.).
+_SAFE_URL_RE = re.compile(r"^https://")
+
+
+def _validate_sync_inputs(url: str, ref: str) -> None:
+    """Validate sync_url and sync_ref to prevent argument injection / SSRF."""
+    if not _SAFE_URL_RE.match(url):
+        raise ValueError(f"sync_url must use HTTPS scheme, got: {url[:120]}")
+    if not _SAFE_REF_RE.match(ref):
+        raise ValueError(f"sync_ref contains invalid characters: {ref[:120]}")
+    if ref.startswith("-"):
+        raise ValueError(f"sync_ref must not start with '-': {ref[:120]}")
 
 
 def sync_models(settings: SmithySettings) -> str:
@@ -13,6 +30,8 @@ def sync_models(settings: SmithySettings) -> str:
         return settings.model_path
     if not settings.auto_sync:
         return settings.model_path
+
+    _validate_sync_inputs(settings.sync_url, settings.sync_ref)
 
     cache_path = Path(settings.cache_path)
     repo_path = cache_path / "api-models-aws"
@@ -73,6 +92,7 @@ def get_model_commit_sha(cache_path: str) -> str | None:
 def _run(cmd: list[str]) -> None:
     result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        # Only include the subcommand (e.g. "clone", "fetch") — never the full args
+        # to avoid leaking repository URLs that may contain credentials.
+        subcmd = cmd[1] if len(cmd) > 1 else cmd[0]
+        raise RuntimeError(f"git {subcmd} failed (exit {result.returncode}): {result.stderr[:200]}")

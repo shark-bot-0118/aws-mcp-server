@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Callable
 
 
@@ -23,17 +25,19 @@ class AWSCredentials:
 
 
 # Fields that must never appear in logs
-SENSITIVE_FIELDS = frozenset({
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "secret",
-    "password",
-    "credential",
-    "authorization",
-    "secret_access_key",
-    "session_token",
-})
+SENSITIVE_FIELDS = frozenset(
+    {
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "secret_access_key",
+        "session_token",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -61,7 +65,13 @@ class RequestContext:
     aws_credentials: AWSCredentials | None = None
     aws_account_id: str | None = None
     aws_role_arn: str | None = None
-    raw_claims: dict[str, Any] = field(default_factory=dict)
+    raw_claims: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        # Defensive copy to prevent external mutations from leaking into context.
+        object.__setattr__(self, "raw_claims", MappingProxyType(dict(self.raw_claims)))
 
     def __repr__(self) -> str:
         """Safe repr that never includes sensitive fields."""

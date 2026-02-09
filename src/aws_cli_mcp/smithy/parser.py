@@ -71,48 +71,116 @@ class SmithyModel:
 
 def parse_model(data: dict[str, object]) -> SmithyModel:
     shapes: dict[str, Shape] = {}
-    for shape_id, shape_data in data.get("shapes", {}).items():
-        shape_type = shape_data.get("type")
-        traits = shape_data.get("traits", {}) or {}
+    raw_shapes = data.get("shapes")
+    if not isinstance(raw_shapes, dict):
+        return SmithyModel(shapes=shapes)
+
+    for raw_shape_id, raw_shape_data in raw_shapes.items():
+        if not isinstance(raw_shape_id, str) or not isinstance(raw_shape_data, dict):
+            continue
+        shape_id = raw_shape_id
+        shape_data = raw_shape_data
+
+        shape_type_obj = shape_data.get("type")
+        if not isinstance(shape_type_obj, str):
+            continue
+        shape_type = shape_type_obj
+
+        traits_obj = shape_data.get("traits", {}) or {}
+        traits = traits_obj if isinstance(traits_obj, dict) else {}
+
         if shape_type == "structure":
             members: dict[str, Member] = {}
-            for name, member in (shape_data.get("members") or {}).items():
-                members[name] = Member(target=member["target"], traits=member.get("traits", {}) or {})
+            raw_members = shape_data.get("members") or {}
+            if isinstance(raw_members, dict):
+                for name, member in raw_members.items():
+                    if not isinstance(name, str) or not isinstance(member, dict):
+                        continue
+                    target = member.get("target")
+                    if not isinstance(target, str):
+                        continue
+                    member_traits = member.get("traits", {}) or {}
+                    members[name] = Member(
+                        target=target,
+                        traits=member_traits if isinstance(member_traits, dict) else {},
+                    )
             shapes[shape_id] = StructureShape(
                 shape_id=shape_id, type=shape_type, traits=traits, members=members
             )
         elif shape_type == "union":
-            members: dict[str, Member] = {}
-            for name, member in (shape_data.get("members") or {}).items():
-                members[name] = Member(target=member["target"], traits=member.get("traits", {}) or {})
+            union_members: dict[str, Member] = {}
+            raw_members = shape_data.get("members") or {}
+            if isinstance(raw_members, dict):
+                for name, member in raw_members.items():
+                    if not isinstance(name, str) or not isinstance(member, dict):
+                        continue
+                    target = member.get("target")
+                    if not isinstance(target, str):
+                        continue
+                    member_traits = member.get("traits", {}) or {}
+                    union_members[name] = Member(
+                        target=target,
+                        traits=member_traits if isinstance(member_traits, dict) else {},
+                    )
             shapes[shape_id] = UnionShape(
-                shape_id=shape_id, type=shape_type, traits=traits, members=members
+                shape_id=shape_id, type=shape_type, traits=traits, members=union_members
             )
         elif shape_type == "list" or shape_type == "set":
             member = shape_data.get("member") or {}
+            member_dict = member if isinstance(member, dict) else {}
+            target = member_dict.get("target")
+            if not isinstance(target, str):
+                continue
+            member_traits = member_dict.get("traits", {}) or {}
             shapes[shape_id] = ListShape(
                 shape_id=shape_id,
                 type=shape_type,
                 traits=traits,
-                member=Member(target=member["target"], traits=member.get("traits", {}) or {}),
+                member=Member(
+                    target=target,
+                    traits=member_traits if isinstance(member_traits, dict) else {},
+                ),
             )
         elif shape_type == "map":
             key = shape_data.get("key") or {}
             value = shape_data.get("value") or {}
+            key_dict = key if isinstance(key, dict) else {}
+            value_dict = value if isinstance(value, dict) else {}
+            key_target = key_dict.get("target")
+            value_target = value_dict.get("target")
+            if not isinstance(key_target, str) or not isinstance(value_target, str):
+                continue
+            key_traits = key_dict.get("traits", {}) or {}
+            value_traits = value_dict.get("traits", {}) or {}
             shapes[shape_id] = MapShape(
                 shape_id=shape_id,
                 type=shape_type,
                 traits=traits,
-                key=Member(target=key["target"], traits=key.get("traits", {}) or {}),
-                value=Member(target=value["target"], traits=value.get("traits", {}) or {}),
+                key=Member(
+                    target=key_target,
+                    traits=key_traits if isinstance(key_traits, dict) else {},
+                ),
+                value=Member(
+                    target=value_target,
+                    traits=value_traits if isinstance(value_traits, dict) else {},
+                ),
             )
         elif shape_type == "string":
-            enum_values = None
+            enum_values: list[str] | None = None
             enum_trait = traits.get("smithy.api#enum")
             if isinstance(enum_trait, list):
-                enum_values = [entry.get("value") for entry in enum_trait if "value" in entry]
-            if isinstance(shape_data.get("enum"), list):
-                enum_values = shape_data.get("enum")
+                trait_values: list[str] = []
+                for entry in enum_trait:
+                    if not isinstance(entry, dict):
+                        continue
+                    value = entry.get("value")
+                    if isinstance(value, str):
+                        trait_values.append(value)
+                enum_values = trait_values
+            raw_shape_enum = shape_data.get("enum")
+            if isinstance(raw_shape_enum, list):
+                shape_values = [item for item in raw_shape_enum if isinstance(item, str)]
+                enum_values = shape_values
             shapes[shape_id] = StringShape(
                 shape_id=shape_id,
                 type=shape_type,
@@ -135,24 +203,44 @@ def parse_model(data: dict[str, object]) -> SmithyModel:
         }:
             shapes[shape_id] = Shape(shape_id=shape_id, type=shape_type, traits=traits)
         elif shape_type == "operation":
+            input_target = None
+            output_target = None
+            raw_input = shape_data.get("input") or {}
+            raw_output = shape_data.get("output") or {}
+            if isinstance(raw_input, dict):
+                target = raw_input.get("target")
+                if isinstance(target, str):
+                    input_target = target
+            if isinstance(raw_output, dict):
+                target = raw_output.get("target")
+                if isinstance(target, str):
+                    output_target = target
             shapes[shape_id] = OperationShape(
                 shape_id=shape_id,
                 type=shape_type,
                 traits=traits,
-                input=(shape_data.get("input") or {}).get("target"),
-                output=(shape_data.get("output") or {}).get("target"),
+                input=input_target,
+                output=output_target,
                 documentation=_extract_documentation(shape_data, traits),
-                examples=traits.get("smithy.api#examples"),
+                examples=(
+                    traits.get("smithy.api#examples")
+                    if isinstance(traits.get("smithy.api#examples"), list)
+                    else None
+                ),
             )
         elif shape_type == "service":
+            operations: list[str] = []
+            raw_operations = shape_data.get("operations") or []
+            if isinstance(raw_operations, list):
+                for op in raw_operations:
+                    target = op.get("target") if isinstance(op, dict) else op
+                    if isinstance(target, str):
+                        operations.append(target)
             shapes[shape_id] = ServiceShape(
                 shape_id=shape_id,
                 type=shape_type,
                 traits=traits,
-                operations=[
-                    (op.get("target") if isinstance(op, dict) else op)
-                    for op in (shape_data.get("operations") or [])
-                ],
+                operations=operations,
             )
         else:
             shapes[shape_id] = Shape(shape_id=shape_id, type=shape_type, traits=traits)
@@ -161,8 +249,9 @@ def parse_model(data: dict[str, object]) -> SmithyModel:
 
 
 def _extract_documentation(shape_data: dict[str, object], traits: dict[str, object]) -> str | None:
-    if "documentation" in shape_data:
-        return shape_data["documentation"]
+    doc = shape_data.get("documentation")
+    if isinstance(doc, str):
+        return doc
     doc_trait = traits.get("smithy.api#documentation")
     if isinstance(doc_trait, str):
         return doc_trait

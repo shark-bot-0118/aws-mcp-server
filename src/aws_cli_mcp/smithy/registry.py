@@ -16,9 +16,7 @@ def resolve_service_model_paths(base_path: str, services: list[str]) -> dict[str
         service_dir = models_dir / service
         if not service_dir.exists():
             continue
-        versions = sorted(
-            [p for p in service_dir.iterdir() if p.is_dir()], key=lambda p: p.name
-        )
+        versions = sorted([p for p in service_dir.iterdir() if p.is_dir()], key=lambda p: p.name)
         if not versions:
             continue
         latest = versions[-1]

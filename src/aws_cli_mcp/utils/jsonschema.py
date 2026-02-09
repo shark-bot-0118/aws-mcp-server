@@ -186,13 +186,15 @@ def format_structured_errors(errors: list[ValidationError]) -> dict[str, object]
                 field = err.path or "unknown"
             missing.append(field)
         else:
-            invalid.append({
-                "path": err.path,
-                "type": err.type,
-                "expected": err.expected,
-                "got": err.got,
-                "reason": err.message,
-            })
+            invalid.append(
+                {
+                    "path": err.path,
+                    "type": err.type,
+                    "expected": err.expected,
+                    "got": err.got,
+                    "reason": err.message,
+                }
+            )
             if err.allowed_values and err.path:
                 allowed_values_map[err.path] = err.allowed_values
 

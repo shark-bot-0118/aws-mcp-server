@@ -1,52 +1,42 @@
+from __future__ import annotations
 
-import sys
-import os
-import json
-import datetime
-import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.append(os.path.join(os.getcwd(), "src"))
+import pytest
 
 from aws_cli_mcp.audit.artifacts import ArtifactStore
 
-def test_audit_serialization():
-    print("--- Verify ArtifactStore Serialization ---")
-    tmp_dir = Path("./tmp_audit_test")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-        
-    store = ArtifactStore(str(tmp_dir))
-    
-    payload = {
-        "timestamp": datetime.datetime(2023, 1, 1, 12, 0, 0),
-        "binary": b"some bytes",
-        "nested": {
-            "more_bytes": b"nested"
-        }
-    }
-    
-    print("Attempting to write_json with datetime and bytes...")
-    try:
-        record = store.write_json("test_record", payload, prefix="test")
-        print(f"[SUCCESS] Artifact created: {record.location}")
-        
-        # Verify content on disk
-        with open(record.location, "r") as f:
-            content = json.load(f)
-            print(f"  Content loaded: {content}")
-            
-        # expected: timestamp as string, binary as string (from json_default)
-        if isinstance(content["timestamp"], str) and isinstance(content["binary"], str):
-            print("  [PASS] Datetime and bytes serialized correctly.")
-        else:
-            print("  [FAIL] Content types unexpected.")
-            
-    except Exception as e:
-        print(f"[FAIL] write_json crashed: {e}")
-    finally:
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
 
-if __name__ == "__main__":
-    test_audit_serialization()
+def test_artifact_store_write_and_read_json(tmp_path: Path) -> None:
+    store = ArtifactStore(str(tmp_path))
+    payload = {
+        "timestamp": datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        "binary": b"bytes-data",
+    }
+
+    record = store.write_json("request", payload, prefix="tx")
+    loaded = store.read_json(record.location)
+
+    assert record.kind == "request"
+    assert Path(record.location).exists()
+    assert isinstance(loaded["timestamp"], str)
+    assert isinstance(loaded["binary"], str)
+
+
+def test_artifact_store_write_text(tmp_path: Path) -> None:
+    store = ArtifactStore(str(tmp_path))
+    record = store.write_text("summary", "hello", prefix="op")
+
+    assert record.kind == "summary"
+    assert Path(record.location).suffix == ".txt"
+    assert Path(record.location).read_text(encoding="utf-8") == "hello"
+
+
+def test_artifact_store_read_json_rejects_path_outside_base(tmp_path: Path) -> None:
+    store = ArtifactStore(str(tmp_path))
+    outside = tmp_path.parent / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside base directory"):
+        store.read_json(str(outside))

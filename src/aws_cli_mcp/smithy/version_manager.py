@@ -137,9 +137,7 @@ class VersionManager:
         entry = snapshot.catalog.find_operation(service, operation)
         if entry is None:
             raise ValueError(f"Operation not found: {service}:{operation}")
-        return snapshot.schema_generator.generate_operation_input_schema(
-            entry.operation_shape_id
-        )
+        return snapshot.schema_generator.generate_operation_input_schema(entry.operation_shape_id)
 
     def _create_snapshot(self, version: str) -> ModelSnapshot:
         """Create a new model snapshot."""
@@ -202,9 +200,7 @@ def get_version_manager() -> VersionManager:
     This is lazily initialized when first called via init_version_manager().
     """
     if _version_manager is None:
-        raise RuntimeError(
-            "Version manager not initialized. Call init_version_manager() first."
-        )
+        raise RuntimeError("Version manager not initialized. Call init_version_manager() first.")
     return _version_manager
 
 

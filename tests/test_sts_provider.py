@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,6 +54,60 @@ def test_assume_role_sync_omits_tags_parameter(monkeypatch: pytest.MonkeyPatch) 
     assert call["WebIdentityToken"] == "jwt-token"
     assert call["DurationSeconds"] == 3600
     assert "Tags" not in call
+
+
+def test_temporary_credentials_repr_masks_access_key() -> None:
+    creds = TemporaryCredentials(
+        access_key_id="ASIAXXXXXXXX",
+        secret_access_key="secret",
+        session_token="token",
+        expiration=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        assumed_role_arn="arn:aws:sts::111111111111:assumed-role/TestRole/mcp-user",
+        assumed_role_id="AROATEST:mcp-user",
+    )
+    rendered = repr(creds)
+    assert "ASIAXXXX***" in rendered
+    assert "secret" not in rendered
+
+
+def test_get_client_initializes_once() -> None:
+    provider = STSCredentialProvider(region="us-east-1")
+    session = MagicMock()
+    session.create_client.return_value = MagicMock()
+    with patch(
+        "aws_cli_mcp.aws_credentials.sts_provider.botocore.session.get_session",
+        return_value=session,
+    ):
+        first = provider._get_client()
+        second = provider._get_client()
+    assert first is second
+    session.create_client.assert_called_once()
+
+
+def test_get_client_double_checked_lock_branch() -> None:
+    provider = STSCredentialProvider(region="us-east-1")
+
+    class _Lock:
+        def __enter__(self_nonlocal):
+            provider._client = "client-from-lock"
+            return self_nonlocal
+
+        def __exit__(self_nonlocal, exc_type, exc, tb):
+            return False
+
+    provider._client = None
+    provider._lock = _Lock()  # type: ignore[assignment]
+    assert provider._get_client() == "client-from-lock"
+
+
+def test_sanitize_session_name_edge_cases() -> None:
+    provider = STSCredentialProvider(region="us-east-1")
+    assert provider._sanitize_session_name("!") == "mcp-"
+
+    long_name = "invalid name with spaces and symbols !!! " * 5
+    sanitized = provider._sanitize_session_name(long_name)
+    assert len(sanitized) <= 64
+    assert "-" in sanitized
 
 
 @pytest.mark.asyncio

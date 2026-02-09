@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import uuid
+from functools import lru_cache
 from typing import Any, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -18,22 +19,27 @@ from ..middleware.security import get_client_ip
 
 logger = logging.getLogger(__name__)
 
-# Compile regex patterns for masking
-_MASK_PATTERNS: dict[str, re.Pattern] = {}
+_MAX_MASK_DEPTH = 20
+
+# Control character pattern for log injection prevention.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 
+def _sanitize_log_value(value: str) -> str:
+    """Replace control characters (newlines, tabs, etc.) to prevent log injection."""
+    return _CONTROL_CHAR_RE.sub("_", value)
+
+
+@lru_cache(maxsize=128)
 def _get_mask_pattern(field: str) -> re.Pattern:
     """Get or create regex pattern for field masking."""
-    if field not in _MASK_PATTERNS:
-        # Match field in JSON-like strings: "field": "value" or 'field': 'value'
-        _MASK_PATTERNS[field] = re.compile(
-            rf'(["\']?{re.escape(field)}["\']?\s*[:=]\s*)["\']?[^"\']*["\']?',
-            re.IGNORECASE,
-        )
-    return _MASK_PATTERNS[field]
+    return re.compile(
+        rf'(["\']?{re.escape(field)}["\']?\s*[:=]\s*)["\']?[^"\']*["\']?',
+        re.IGNORECASE,
+    )
 
 
-def mask_sensitive_data(data: Any, mask_fields: frozenset[str]) -> Any:
+def mask_sensitive_data(data: Any, mask_fields: frozenset[str], depth: int = 0) -> Any:
     """
     Recursively mask sensitive fields in data structures.
 
@@ -42,6 +48,8 @@ def mask_sensitive_data(data: Any, mask_fields: frozenset[str]) -> Any:
     - Lists: recursively processes items
     - Strings: masks patterns like "field": "value"
     """
+    if depth >= _MAX_MASK_DEPTH:
+        return "***MASKED***"
     if isinstance(data, dict):
         result = {}
         for key, value in data.items():
@@ -49,10 +57,10 @@ def mask_sensitive_data(data: Any, mask_fields: frozenset[str]) -> Any:
             if lower_key in mask_fields or any(f in lower_key for f in mask_fields):
                 result[key] = "***MASKED***"
             else:
-                result[key] = mask_sensitive_data(value, mask_fields)
+                result[key] = mask_sensitive_data(value, mask_fields, depth + 1)
         return result
     elif isinstance(data, list):
-        return [mask_sensitive_data(item, mask_fields) for item in data]
+        return [mask_sensitive_data(item, mask_fields, depth + 1) for item in data]
     elif isinstance(data, str):
         # Mask patterns in strings
         masked = data
@@ -116,13 +124,17 @@ class AuditMiddleware(BaseHTTPMiddleware):
             trust_forwarded_headers=self._trust_forwarded_headers,
         )
 
+        # Sanitize user-controlled values to prevent log injection.
+        safe_path = _sanitize_log_value(request.url.path)
+        safe_ip = _sanitize_log_value(client_ip)
+
         # Log request start
         logger.info(
             "REQUEST_START request_id=%s method=%s path=%s client_ip=%s",
             request_id,
             request.method,
-            request.url.path,
-            client_ip,
+            safe_path,
+            safe_ip,
         )
 
         error_message: str | None = None
@@ -155,7 +167,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                     request_id,
                     user_id,
                     request.method,
-                    request.url.path,
+                    safe_path,
                     status_code,
                     duration_ms,
                     error_message,
@@ -167,7 +179,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                     request_id,
                     user_id,
                     request.method,
-                    request.url.path,
+                    safe_path,
                     status_code,
                     duration_ms,
                 )

@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 
 def test_http_mode_uses_to_thread_for_blocking_io(monkeypatch):
-    from aws_cli_mcp import config as config_module
-    from aws_cli_mcp.app import get_app_context
-    from aws_cli_mcp.tools.aws_unified import execute_operation
-
-    monkeypatch.setenv("TRANSPORT_MODE", "http")
-    config_module._load_settings_cached.cache_clear()
-    get_app_context.cache_clear()
+    from aws_cli_mcp.tools.aws_unified import _run_blocking
 
     calls = {"count": 0}
 
@@ -19,14 +14,13 @@ def test_http_mode_uses_to_thread_for_blocking_io(monkeypatch):
         return func(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            server=SimpleNamespace(transport_mode="http"),
+        )
+    )
 
-    payload = {
-        "action": "validate",
-        "service": "s3",
-        "operation": "ListBuckets",
-        "payload": {},
-    }
-    result = asyncio.run(execute_operation(payload))
+    result = asyncio.run(_run_blocking(ctx, lambda x: x + 1, 41))
 
-    assert result is not None
-    assert calls["count"] >= 1
+    assert result == 42
+    assert calls["count"] == 1

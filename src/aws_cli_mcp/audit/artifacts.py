@@ -18,11 +18,17 @@ class ArtifactStore:
         self._base.mkdir(parents=True, exist_ok=True)
 
     def write_json(self, kind: str, payload: dict, prefix: str | None = None) -> ArtifactRecord:
-        data = json.dumps(payload, ensure_ascii=True, indent=2, default=json_default).encode("utf-8")
+        data = json.dumps(payload, ensure_ascii=True, indent=2, default=json_default).encode(
+            "utf-8"
+        )
         return self._write_bytes(kind, data, suffix=".json", prefix=prefix)
 
     def read_json(self, location: str) -> dict:
-        path = Path(location)
+        path = Path(location).resolve()
+        # Validate that the resolved path is within the base directory
+        # to prevent path traversal via tampered location values.
+        if not path.is_relative_to(self._base.resolve()):
+            raise ValueError(f"Path is outside base directory: {location}")
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 

@@ -1,6 +1,8 @@
 # Python関連
 __pycache__/
 .venv/
+.mypy_cache/
+.ruff_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -56,6 +58,7 @@ credentials/
 # その他
 temp/
 tmp/
-scripts/
 .coverage
-htmlcov/ 
+.coverage.*
+coverage.xml
+htmlcov/

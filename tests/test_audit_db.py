@@ -1,6 +1,8 @@
 import pytest
+
 from aws_cli_mcp.audit.db import SqliteStore
-from aws_cli_mcp.audit.models import AuditTxRecord, AuditOpRecord, ArtifactRecord
+from aws_cli_mcp.audit.models import ArtifactRecord, AuditOpRecord, AuditTxRecord
+
 
 @pytest.fixture
 def db_path(tmp_path):
@@ -8,7 +10,9 @@ def db_path(tmp_path):
 
 @pytest.fixture
 def store(db_path):
-    return SqliteStore(db_path)
+    sqlite_store = SqliteStore(db_path)
+    yield sqlite_store
+    sqlite_store.close()
 
 def test_tx_lifecycle(store):
     rec = AuditTxRecord(
@@ -23,11 +27,7 @@ def test_tx_lifecycle(store):
         completed_at=None
     )
     store.create_tx(rec)
-    
-    # Verify via direct SQL since there's no get_tx
-    # Wait, store.get_tx exists in other tests? 
-    # Let's trust the existing logic or check store method? 
-    # Previous code used fetch_one.
+
     row = store.fetch_one("SELECT * FROM audit_tx WHERE tx_id=?", ("tx-1",))
     assert row["status"] == "running"
     
@@ -59,7 +59,67 @@ def test_op_lifecycle(store):
     row = store.fetch_one("SELECT * FROM audit_op WHERE op_id=?", ("op-1",))
     assert row["status"] == "success"
     assert row["duration_ms"] == 100
-    
+
+
+def test_get_pending_op(store):
+    tx = AuditTxRecord(
+        tx_id="tx-pending",
+        plan_id=None,
+        status="running",
+        actor=None,
+        role=None,
+        account=None,
+        region=None,
+        started_at="now",
+        completed_at=None,
+    )
+    store.create_tx(tx)
+
+    op = AuditOpRecord(
+        op_id="op-pending",
+        tx_id="tx-pending",
+        service="s3",
+        operation="DeleteObject",
+        request_hash="hash",
+        status="PendingConfirmation",
+        duration_ms=None,
+        error=None,
+        response_summary=None,
+        created_at="now",
+    )
+    store.create_op(op)
+
+    pending = store.get_pending_op("tx-pending")
+    assert pending is not None
+    assert pending.op_id == "op-pending"
+
+
+def test_get_pending_op_returns_none(store):
+    assert store.get_pending_op("missing-tx") is None
+
+
+def test_claim_pending_tx_atomic_transition(store):
+    tx = AuditTxRecord(
+        tx_id="tx-claim",
+        plan_id=None,
+        status="PendingConfirmation",
+        actor=None,
+        role=None,
+        account=None,
+        region=None,
+        started_at="now",
+        completed_at=None,
+    )
+    store.create_tx(tx)
+
+    assert store.claim_pending_tx("tx-claim") is True
+    row = store.fetch_one("SELECT status FROM audit_tx WHERE tx_id = ?", ("tx-claim",))
+    assert row["status"] == "Started"
+
+    assert store.claim_pending_tx("tx-claim") is False
+    assert store.claim_pending_tx("tx-missing") is False
+
+
 def test_audit_artifact(store):
     # Create tx first for FK constraint
     tx = AuditTxRecord(
@@ -81,9 +141,16 @@ def test_audit_artifact(store):
     row = store.fetch_one("SELECT * FROM audit_artifacts WHERE artifact_id=?", ("art-1",))
     assert row["location"] == "/tmp/file"
 
+
+def test_cleanup_pending_txs_returns_zero_when_empty(store):
+    deleted = store.cleanup_pending_txs(ttl_seconds=1)
+    assert deleted == 0
+
 def test_wal_mode(tmp_path):
     # Verify WAL mode is set
     path = str(tmp_path / "wal.db")
     store = SqliteStore(path, wal=True)
     row = store.fetch_one("PRAGMA journal_mode", [])
     assert row[0].upper() == "WAL"
+    store.close()
+    store.close()

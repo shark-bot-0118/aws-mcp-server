@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 from starlette.applications import Starlette
@@ -27,7 +28,7 @@ from aws_cli_mcp.aws_credentials.cache import CredentialCache
 from aws_cli_mcp.aws_credentials.sts_provider import STSCredentialProvider
 from aws_cli_mcp.config import load_settings
 from aws_cli_mcp.utils.hashing import sha256_text
-from aws_cli_mcp.utils.http import first_forwarded_value
+from aws_cli_mcp.utils.http import normalize_public_base_url, resolve_request_origin
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +52,7 @@ def create_http_app() -> Starlette:
     if auth_provider == "identity-center":
         return _create_identity_center_app(settings)
 
-    raise RuntimeError(
-        "Unsupported AUTH_PROVIDER. "
-        "Use one of: multi-idp, identity-center"
-    )
+    raise RuntimeError("Unsupported AUTH_PROVIDER. Use one of: multi-idp, identity-center")
 
 
 def _create_multi_idp_app(settings: Any) -> Starlette:
@@ -79,16 +77,25 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
 
     logger.info("Loading IdP config from: %s", idp_config_path)
     idp_config = load_idp_config(idp_config_path)
+    transport_mode = str(settings.server.transport_mode).strip().lower()
+    public_base_url = getattr(settings.server, "public_base_url", None)
+    if transport_mode == "remote" and not public_base_url:
+        raise RuntimeError(
+            "MCP_PUBLIC_BASE_URL is required for TRANSPORT_MODE=remote with "
+            "AUTH_PROVIDER=multi-idp"
+        )
 
     # Create validators and handlers
     multi_idp_validator = MultiIdPValidator(idp_config)
     protected_resource_endpoint = create_protected_resource_endpoint(
         idp_config,
         trust_forwarded_headers=settings.server.http_trust_forwarded_headers,
+        public_base_url=public_base_url,
     )
     oauth_proxy = create_oauth_proxy_broker(
         idp_config,
         trust_forwarded_headers=settings.server.http_trust_forwarded_headers,
+        public_base_url=public_base_url,
     )
     role_mapper = RoleMapper(idp_config.role_mappings)
 
@@ -133,10 +140,11 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
             validator=multi_idp_validator,
             challenge_resource=idp_config.protected_resource.resource,
             challenge_scopes=tuple(idp_config.protected_resource.scopes_supported),
-            resource_metadata_path="/.well-known/oauth-protected-resource",
+            resource_metadata_path="/.well-known/oauth-protected-resource/mcp",
             exempt_paths=oauth_exempt_paths,
             allow_multi_user=settings.auth.allow_multi_user,
             trust_forwarded_headers=settings.server.http_trust_forwarded_headers,
+            public_base_url=public_base_url,
         ),
         Middleware(
             UserRateLimitMiddleware,
@@ -156,11 +164,14 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
         ),
     ]
 
-    # Add CORS if configured
+    # Add CORS if configured — MUST be outermost (list head) so that
+    # OPTIONS preflight requests receive CORS headers before any auth
+    # middleware can reject them with 401.
     if settings.server.http_enable_cors and settings.server.http_allowed_origins:
         from starlette.middleware.cors import CORSMiddleware
 
-        middleware.append(
+        middleware.insert(
+            0,
             Middleware(
                 CORSMiddleware,
                 allow_origins=list(settings.server.http_allowed_origins),
@@ -171,12 +182,13 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
                     "Accept",
                     "MCP-Protocol-Version",
                 ],
-            )
+            ),
         )
 
     # Route handlers
     async def mcp_handler(request: Request) -> Response:
         from aws_cli_mcp.transport.mcp_handler import handle_mcp_request
+
         return await handle_mcp_request(request)
 
     async def health_handler(request: Request) -> Response:
@@ -225,7 +237,8 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
             ]
         )
 
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
         logger.info("Starting multi-IdP HTTP server...")
         # Pre-initialize STS client
         await asyncio.to_thread(sts_provider._get_client)
@@ -239,11 +252,15 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
                     exc_info=True,
                 )
         logger.info("Multi-IdP HTTP server started")
+        try:
+            yield
+        finally:
+            logger.info("Stopping multi-IdP HTTP server...")
 
     app = Starlette(
         routes=routes,
         middleware=middleware,
-        on_startup=[startup],
+        lifespan=lifespan,
     )
     app.state.strict_mcp_http = settings.server.transport_mode == "remote"
     app.state.http_allowed_origins = tuple(settings.server.http_allowed_origins)
@@ -253,19 +270,47 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
 
 def _create_identity_center_app(settings: Any) -> Starlette:
     """Create app with IAM Identity Center auth."""
+    from aws_cli_mcp.auth.idp_config import AuditConfig, SecurityConfig
+    from aws_cli_mcp.middleware.audit import AuditMiddleware
+    from aws_cli_mcp.middleware.security import PreAuthSecurityMiddleware, UserRateLimitMiddleware
+
     _validate_identity_center_settings(settings)
+
+    security_config = SecurityConfig(
+        rate_limit_per_user=settings.auth.rate_limit_per_user,
+        rate_limit_per_ip=settings.auth.rate_limit_per_ip,
+        max_body_size_bytes=settings.auth.max_body_size_mb * 1024 * 1024,
+        max_header_size_bytes=settings.auth.max_header_size_kb * 1024,
+        request_timeout_seconds=settings.auth.request_timeout_seconds,
+    )
+    audit_config = AuditConfig(enabled=settings.auth.audit_enabled)
 
     middleware = [
         Middleware(
+            PreAuthSecurityMiddleware,
+            config=security_config,
+            trust_forwarded_headers=settings.server.http_trust_forwarded_headers,
+        ),
+        Middleware(
             IdentityCenterAuthMiddleware,
             allow_multi_user=settings.auth.allow_multi_user,
+        ),
+        Middleware(
+            UserRateLimitMiddleware,
+            config=security_config,
+        ),
+        Middleware(
+            AuditMiddleware,
+            config=audit_config,
+            trust_forwarded_headers=settings.server.http_trust_forwarded_headers,
         ),
     ]
 
     if settings.server.http_enable_cors and settings.server.http_allowed_origins:
         from starlette.middleware.cors import CORSMiddleware
 
-        middleware.append(
+        middleware.insert(
+            0,
             Middleware(
                 CORSMiddleware,
                 allow_origins=list(settings.server.http_allowed_origins),
@@ -276,11 +321,12 @@ def _create_identity_center_app(settings: Any) -> Starlette:
                     "Accept",
                     "MCP-Protocol-Version",
                 ],
-            )
+            ),
         )
 
     async def mcp_handler(request: Request) -> Response:
         from aws_cli_mcp.transport.mcp_handler import handle_mcp_request
+
         return await handle_mcp_request(request)
 
     async def health_handler(request: Request) -> Response:
@@ -332,10 +378,11 @@ class MultiIdPAuthMiddleware(BaseHTTPMiddleware):
         validator: Any,
         challenge_resource: str = "auto",
         challenge_scopes: tuple[str, ...] = (),
-        resource_metadata_path: str = "/.well-known/oauth-protected-resource",
+        resource_metadata_path: str = "/.well-known/oauth-protected-resource/mcp",
         exempt_paths: tuple[str, ...] = (),
         allow_multi_user: bool = False,
         trust_forwarded_headers: bool = False,
+        public_base_url: str | None = None,
     ) -> None:
         super().__init__(app)
         self.validator = validator
@@ -345,35 +392,29 @@ class MultiIdPAuthMiddleware(BaseHTTPMiddleware):
         self.exempt_paths = self.EXEMPT_PATHS | set(exempt_paths)
         self.allow_multi_user = allow_multi_user
         self.trust_forwarded_headers = trust_forwarded_headers
-
-    @staticmethod
-    def _first_forwarded_value(value: str | None) -> str | None:
-        return first_forwarded_value(value)
+        self.public_base_url = (
+            normalize_public_base_url(public_base_url) if public_base_url else None
+        )
 
     def _build_resource_metadata_url(self, request: Request) -> str:
-        forwarded_proto = None
-        forwarded_host = None
-        if self.trust_forwarded_headers:
-            forwarded_proto = self._first_forwarded_value(request.headers.get("x-forwarded-proto"))
-            forwarded_host = self._first_forwarded_value(request.headers.get("x-forwarded-host"))
-
-        scheme = forwarded_proto or request.url.scheme
-        host = forwarded_host or request.headers.get("host") or request.url.netloc
-        return f"{scheme}://{host}{self.resource_metadata_path}"
+        origin = resolve_request_origin(
+            request,
+            trust_forwarded_headers=self.trust_forwarded_headers,
+            public_base_url=self.public_base_url,
+        )
+        return f"{origin}{self.resource_metadata_path}"
 
     def _resolve_challenge_resource(self, request: Request) -> str:
         configured = (self.challenge_resource or "").strip()
         if configured and configured.lower() != "auto":
             return configured
 
-        forwarded_proto = None
-        forwarded_host = None
-        if self.trust_forwarded_headers:
-            forwarded_proto = self._first_forwarded_value(request.headers.get("x-forwarded-proto"))
-            forwarded_host = self._first_forwarded_value(request.headers.get("x-forwarded-host"))
-        scheme = forwarded_proto or request.url.scheme
-        host = forwarded_host or request.headers.get("host") or request.url.netloc
-        return f"{scheme}://{host}/mcp"
+        origin = resolve_request_origin(
+            request,
+            trust_forwarded_headers=self.trust_forwarded_headers,
+            public_base_url=self.public_base_url,
+        )
+        return f"{origin}/mcp"
 
     def _resolve_challenge_scopes(self, request: Request) -> tuple[str, ...]:
         if not self.challenge_scopes:
@@ -548,13 +589,13 @@ class MultiIdPAWSCredentialMiddleware(BaseHTTPMiddleware):
                     context=context,
                 ),
             )
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to assume role: %s", resolved.role_arn)
             return JSONResponse(
                 status_code=403,
                 content={
                     "error": "credential_error",
-                    "message": f"Failed to assume role: {e}",
+                    "message": "Failed to assume role for this user",
                 },
             )
 

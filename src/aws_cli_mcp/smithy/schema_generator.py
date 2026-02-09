@@ -12,6 +12,8 @@ from aws_cli_mcp.smithy.parser import (
     UnionShape,
 )
 
+_MAX_SCHEMA_DEPTH = 30
+
 
 class SchemaGenerator:
     def __init__(self, model: SmithyModel) -> None:
@@ -43,6 +45,8 @@ class SchemaGenerator:
     def _shape_to_schema(
         self, shape_id: str, definitions: dict[str, object], depth: int = 0
     ) -> dict[str, object]:
+        if depth >= _MAX_SCHEMA_DEPTH:
+            return {"type": "object"}
         if shape_id in definitions:
             return {"$ref": f"#/definitions/{shape_id}"}
 
@@ -68,14 +72,12 @@ class SchemaGenerator:
             }
             if required:
                 schema["required"] = required
-            if required:
-                schema["required"] = required
         elif isinstance(shape, UnionShape):
             # Union types require exactly one member to be set
-            properties: dict[str, object] = {}
+            properties = {}
             for name, member in shape.members.items():
                 properties[name] = self._shape_to_schema(member.target, definitions, depth + 1)
-            schema: dict[str, object] = {
+            schema = {
                 "type": "object",
                 "properties": properties,
                 "additionalProperties": False,
@@ -88,8 +90,8 @@ class SchemaGenerator:
                 "items": self._shape_to_schema(shape.member.target, definitions, depth + 1),
             }
         elif shape.type == "document":
-             # Document types are free-form JSON
-             return {}
+            # Document types are free-form JSON
+            return {}
         elif isinstance(shape, MapShape):
             schema = {
                 "type": "object",
@@ -114,7 +116,7 @@ class SchemaGenerator:
             schema["definitions"] = definitions
         else:
             definitions[shape_id] = schema
-            
+
         return schema
 
     def _primitive_schema(self, shape_type: str) -> dict[str, object]:

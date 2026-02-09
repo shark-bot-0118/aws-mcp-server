@@ -6,6 +6,8 @@ import base64
 import datetime
 import decimal
 
+_MAX_SERIALIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
 
 def json_default(obj: object) -> object:
     """JSON serializer for objects not serializable by default json code."""
@@ -26,7 +28,7 @@ def json_default(obj: object) -> object:
     # Handle Streams (StreamingBody, etc.)
     if hasattr(obj, "read") and callable(obj.read):
         try:
-            content = obj.read()
+            content = obj.read(_MAX_SERIALIZE_BYTES)
             if not content:
                 return ""
             if isinstance(content, bytes):
@@ -35,14 +37,14 @@ def json_default(obj: object) -> object:
                 except UnicodeDecodeError:
                     return base64.b64encode(content).decode("utf-8")
             return content
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             return ""
 
     # Handle Iterables (EventStream, etc.) - excluding str/bytes/dict/list
     if hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes, dict, list)):
         try:
             return list(obj)
-        except Exception:
+        except (TypeError, StopIteration):
             pass
 
     return str(obj)

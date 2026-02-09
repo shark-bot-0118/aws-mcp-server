@@ -74,6 +74,7 @@ class IdentityCenterAuthMiddleware(BaseHTTPMiddleware):
             access_token=access_token,
         )
 
+        request.state.user_id = user_id
         request.state.access_token = access_token
 
         context_token = set_request_context(ctx)

@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from ..utils.http import validate_oidc_url
 from .idp_config import IdPConfig, JWKSCacheConfig, MultiIdPConfig
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,8 @@ class JWKSClient:
                     self._last_failure = datetime.now(timezone.utc)
                     if self._jwks_data is None:
                         raise TokenValidationError(f"JWKS fetch failed: {e}", "jwks_error")
+                else:
+                    await asyncio.sleep(min(2**attempt, 30))
 
 
 class SingleIdPValidator:
@@ -190,6 +193,11 @@ class SingleIdPValidator:
         jwks_uri = doc.get("jwks_uri")
         if not jwks_uri:
             raise TokenValidationError("Missing jwks_uri in discovery", "discovery_error")
+
+        try:
+            validate_oidc_url(str(jwks_uri), label="jwks_uri")
+        except ValueError as exc:
+            raise TokenValidationError(str(exc), "discovery_error") from exc
 
         logger.info("Discovered JWKS URI for %s: %s", self.idp.name, jwks_uri)
         return str(jwks_uri)
@@ -322,7 +330,8 @@ class MultiIdPValidator:
         """
         # azp takes priority (AWS STS compatibility)
         if "azp" in claims:
-            return claims["azp"] in allowed
+            azp = claims.get("azp")
+            return isinstance(azp, str) and azp in allowed
 
         # Fall back to aud
         aud = claims.get("aud")
@@ -333,7 +342,8 @@ class MultiIdPValidator:
             return aud in allowed
 
         if isinstance(aud, list):
-            return bool(set(aud) & allowed)
+            aud_values = {value for value in aud if isinstance(value, str)}
+            return bool(aud_values & allowed)
 
         return False
 
@@ -426,9 +436,11 @@ class MultiIdPValidator:
         normalized_issuer = self._normalize_issuer(raw_issuer)
 
         if normalized_issuer not in self._allowed_issuers:
+            # Use generic error message to avoid revealing allowlist contents
+            # via error message differentiation.
             raise TokenValidationError(
-                f"Issuer not in allowlist: {normalized_issuer}",
-                "unknown_issuer",
+                "Token validation failed",
+                "invalid_token",
             )
 
         # 7. Get IdP config and validator

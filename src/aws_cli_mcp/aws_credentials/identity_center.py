@@ -22,6 +22,8 @@ from aws_cli_mcp.utils.hashing import sha256_text
 
 logger = logging.getLogger(__name__)
 
+_MAX_PAGES = 100
+
 
 @dataclass(frozen=True)
 class AccountEntry:
@@ -119,7 +121,7 @@ class IdentityCenterProvider:
         token: str | None = None
 
         try:
-            while True:
+            for _page in range(_MAX_PAGES):
                 params: dict[str, Any] = {"accessToken": access_token}
                 if token:
                     params["nextToken"] = token
@@ -135,6 +137,8 @@ class IdentityCenterProvider:
                 token = resp.get("nextToken")
                 if not token:
                     break
+            else:
+                logger.warning("list_accounts pagination limit reached (%d pages)", _MAX_PAGES)
         except ClientError as exc:
             raise self._map_client_error(exc)
 
@@ -146,7 +150,7 @@ class IdentityCenterProvider:
         token: str | None = None
 
         try:
-            while True:
+            for _page in range(_MAX_PAGES):
                 params: dict[str, Any] = {"accessToken": access_token, "accountId": account_id}
                 if token:
                     params["nextToken"] = token
@@ -161,6 +165,12 @@ class IdentityCenterProvider:
                 token = resp.get("nextToken")
                 if not token:
                     break
+            else:
+                logger.warning(
+                    "list_account_roles pagination limit reached (%d pages) for account %s",
+                    _MAX_PAGES,
+                    account_id,
+                )
         except ClientError as exc:
             raise self._map_client_error(exc)
 
@@ -199,7 +209,7 @@ class IdentityCenterProvider:
     def _map_client_error(self, exc: ClientError) -> IdentityCenterError:
         error = exc.response.get("Error", {})
         code = error.get("Code", "Unknown")
-        message = error.get("Message", str(exc))
+        raw_message = error.get("Message", str(exc))
 
         code_map = {
             "UnauthorizedException": "unauthorized",
@@ -208,8 +218,18 @@ class IdentityCenterProvider:
             "TooManyRequestsException": "throttled",
         }
 
-        logger.warning("Identity Center error: %s: %s", code, message)
-        return IdentityCenterError(message, code=code_map.get(code, "sso_error"))
+        # Log the full AWS error for operator debugging, but return a
+        # generic message to the client to avoid leaking internal details.
+        mapped_code = code_map.get(code, "sso_error")
+        logger.warning("Identity Center error: %s: %s", code, raw_message)
+        safe_messages: dict[str, str] = {
+            "unauthorized": "Access denied by Identity Center.",
+            "invalid_request": "Invalid Identity Center request.",
+            "invalid_token": "SSO token is invalid or expired.",
+            "throttled": "Too many requests to Identity Center. Please retry later.",
+        }
+        safe_msg = safe_messages.get(mapped_code, "Identity Center operation failed.")
+        return IdentityCenterError(safe_msg, code=mapped_code)
 
 
 @lru_cache(maxsize=1)
@@ -217,7 +237,9 @@ def get_identity_center_provider() -> IdentityCenterProvider:
     settings = load_settings()
     region = settings.auth.identity_center_region
     if not region:
-        raise RuntimeError("AUTH_IDENTITY_CENTER_REGION is required for identity-center auth provider")
+        raise RuntimeError(
+            "AUTH_IDENTITY_CENTER_REGION is required for identity-center auth provider"
+        )
     cache = CredentialCache(
         refresh_buffer_seconds=settings.auth.credential_refresh_buffer_seconds,
         max_entries=settings.auth.credential_cache_max_entries,

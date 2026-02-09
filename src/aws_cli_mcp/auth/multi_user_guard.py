@@ -29,6 +29,10 @@ class _SinglePrincipalGuard:
                 )
 
 
+# Process-local guard. With Uvicorn --workers N (N > 1), each worker
+# tracks its own principal independently — the single-user guarantee
+# only holds within a single process.  Deploy with workers=1 for
+# strict single-user enforcement.
 _guard = _SinglePrincipalGuard()
 
 

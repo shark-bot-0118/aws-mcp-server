@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-pytestmark = pytest.mark.asyncio(loop_scope="function")
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 from starlette.testclient import TestClient
 
 from aws_cli_mcp.auth.idp_config import SecurityConfig
 from aws_cli_mcp.middleware.security import (
+    BodySizeLimitExceeded,
     PreAuthSecurityMiddleware,
     SlidingWindowRateLimiter,
     UserRateLimitMiddleware,
@@ -76,6 +76,18 @@ class TestSlidingWindowRateLimiter:
         # key2 should still be allowed
         assert await limiter.allow("key2", 3) is True
 
+    @pytest.mark.asyncio
+    async def test_cleanup_old_buckets_removes_idle_keys(self) -> None:
+        limiter = SlidingWindowRateLimiter()
+        now = 1000.0
+        limiter._buckets["old"].timestamps = [1.0]
+        limiter._buckets["empty"].timestamps = []
+        limiter._buckets["new"].timestamps = [990.0]
+        limiter._cleanup_old_buckets_unlocked(now)
+        assert "old" not in limiter._buckets
+        assert "empty" not in limiter._buckets
+        assert "new" in limiter._buckets
+
 
 class TestGetClientIp:
     """Tests for get_client_ip function."""
@@ -86,7 +98,7 @@ class TestGetClientIp:
         request.headers = {"x-forwarded-for": "1.2.3.4, 5.6.7.8"}
         request.client = MagicMock(host="10.0.0.1")
 
-        assert get_client_ip(request) == "1.2.3.4"
+        assert get_client_ip(request, trust_forwarded_headers=True) == "1.2.3.4"
 
     def test_x_real_ip(self) -> None:
         """X-Real-IP should be used if X-Forwarded-For is missing."""
@@ -94,7 +106,7 @@ class TestGetClientIp:
         request.headers = {"x-real-ip": "1.2.3.4"}
         request.client = MagicMock(host="10.0.0.1")
 
-        assert get_client_ip(request) == "1.2.3.4"
+        assert get_client_ip(request, trust_forwarded_headers=True) == "1.2.3.4"
 
     def test_client_host(self) -> None:
         """Client host should be used as fallback."""
@@ -128,12 +140,12 @@ class TestPreAuthSecurityMiddleware:
 
         # Health endpoint should always work
         from starlette.testclient import TestClient
-        client = TestClient(middleware)
 
-        # Multiple requests to health should all succeed
-        for _ in range(10):
-            response = client.get("/health")
-            assert response.status_code == 200
+        with closing(TestClient(middleware)) as client:
+            # Multiple requests to health should all succeed
+            for _ in range(10):
+                response = client.get("/health")
+                assert response.status_code == 200
 
     def test_ip_rate_limit_applies_before_auth(self) -> None:
         """IP rate limiting should work even without authentication."""
@@ -148,19 +160,19 @@ class TestPreAuthSecurityMiddleware:
             await response(scope, receive, send)
 
         middleware = PreAuthSecurityMiddleware(app, config)
-        client = TestClient(middleware)
+        middleware.rate_limiter = SlidingWindowRateLimiter()
+        with closing(TestClient(middleware)) as client:
+            # First 2 requests should succeed
+            response1 = client.get("/mcp")
+            assert response1.status_code == 200
 
-        # First 2 requests should succeed
-        response1 = client.get("/mcp")
-        assert response1.status_code == 200
+            response2 = client.get("/mcp")
+            assert response2.status_code == 200
 
-        response2 = client.get("/mcp")
-        assert response2.status_code == 200
-
-        # 3rd request should be rate limited
-        response3 = client.get("/mcp")
-        assert response3.status_code == 429
-        assert response3.json()["error"] == "rate_limit_exceeded"
+            # 3rd request should be rate limited
+            response3 = client.get("/mcp")
+            assert response3.status_code == 429
+            assert response3.json()["error"] == "rate_limit_exceeded"
 
         # App should only have been called twice
         assert call_count == 2
@@ -174,17 +186,54 @@ class TestPreAuthSecurityMiddleware:
             await response(scope, receive, send)
 
         middleware = PreAuthSecurityMiddleware(app, config)
-        client = TestClient(middleware)
+        with closing(TestClient(middleware)) as client:
+            # Request with too large body should be rejected
+            # Note: We're testing via Content-Length header check
+            response = client.post(
+                "/mcp",
+                content="x" * 100,  # Small content
+                headers={"Content-Length": str(2 * 1024 * 1024)},  # Claim 2MB
+            )
+            assert response.status_code == 413
+            assert response.json()["error"] == "request_too_large"
 
-        # Request with too large body should be rejected
-        # Note: We're testing via Content-Length header check
-        response = client.post(
-            "/mcp",
-            content="x" * 100,  # Small content
-            headers={"Content-Length": str(2 * 1024 * 1024)}  # Claim 2MB
-        )
-        assert response.status_code == 413
-        assert response.json()["error"] == "request_too_large"
+    def test_content_length_mismatch_does_not_bypass_limit(self) -> None:
+        """Forged small Content-Length must not bypass stream size check."""
+        config = _create_security_config(max_body_size_bytes=100)
+
+        async def app(scope, receive, send):
+            response = JSONResponse({"status": "ok"})
+            await response(scope, receive, send)
+
+        middleware = PreAuthSecurityMiddleware(app, config)
+        middleware.rate_limiter = SlidingWindowRateLimiter()
+        with closing(TestClient(middleware)) as client:
+            response = client.post(
+                "/mcp",
+                content="x" * 200,
+                headers={"Content-Length": "1"},
+            )
+            assert response.status_code == 413
+            assert response.json()["error"] == "request_too_large"
+
+    def test_negative_content_length_does_not_bypass_limit(self) -> None:
+        """Negative Content-Length must be treated as invalid and still size-checked."""
+        config = _create_security_config(max_body_size_bytes=100)
+
+        async def app(scope, receive, send):
+            response = JSONResponse({"status": "ok"})
+            await response(scope, receive, send)
+
+        middleware = PreAuthSecurityMiddleware(app, config)
+        middleware.rate_limiter = SlidingWindowRateLimiter()
+        with closing(TestClient(middleware)) as client:
+            response = client.post(
+                "/mcp",
+                content="x" * 200,
+                headers={"Content-Length": "-1"},
+            )
+            assert response.status_code == 413
+            assert response.json()["error"] == "request_too_large"
 
     def test_header_size_limit(self) -> None:
         """Large headers should be rejected."""
@@ -195,13 +244,12 @@ class TestPreAuthSecurityMiddleware:
             await response(scope, receive, send)
 
         middleware = PreAuthSecurityMiddleware(app, config)
-        client = TestClient(middleware)
-
-        # Request with too large headers should be rejected
-        large_header = "x" * 2000  # 2KB header value
-        response = client.get("/mcp", headers={"X-Large-Header": large_header})
-        assert response.status_code == 431
-        assert response.json()["error"] == "headers_too_large"
+        with closing(TestClient(middleware)) as client:
+            # Request with too large headers should be rejected
+            large_header = "x" * 2000  # 2KB header value
+            response = client.get("/mcp", headers={"X-Large-Header": large_header})
+            assert response.status_code == 431
+            assert response.json()["error"] == "headers_too_large"
 
     def test_chunked_transfer_body_size_limit(self) -> None:
         """Chunked transfer encoding should not bypass body size limit."""
@@ -219,19 +267,18 @@ class TestPreAuthSecurityMiddleware:
         # Reset rate limiter to avoid interference
         middleware.rate_limiter = SlidingWindowRateLimiter()
 
-        client = TestClient(middleware)
-
-        # Request with chunked encoding (no Content-Length) exceeding limit
-        # TestClient automatically handles this, but we simulate by sending
-        # a POST without explicit Content-Length header
-        large_body = "x" * 200  # 200 bytes > 100 byte limit
-        response = client.post(
-            "/mcp",
-            content=large_body,
-            headers={"Transfer-Encoding": "chunked"},
-        )
-        assert response.status_code == 413
-        assert response.json()["error"] == "request_too_large"
+        with closing(TestClient(middleware)) as client:
+            # Request with chunked encoding (no Content-Length) exceeding limit
+            # TestClient automatically handles this, but we simulate by sending
+            # a POST without explicit Content-Length header
+            large_body = "x" * 200  # 200 bytes > 100 byte limit
+            response = client.post(
+                "/mcp",
+                content=large_body,
+                headers={"Transfer-Encoding": "chunked"},
+            )
+            assert response.status_code == 413
+            assert response.json()["error"] == "request_too_large"
         # App should not have been called
         assert call_count == 0
 
@@ -250,19 +297,157 @@ class TestPreAuthSecurityMiddleware:
         middleware = PreAuthSecurityMiddleware(app, config)
         middleware.rate_limiter = SlidingWindowRateLimiter()
 
-        client = TestClient(middleware)
+        with closing(TestClient(middleware)) as client:
+            # Small body should succeed
+            small_body = "x" * 30
+            response = client.post("/mcp", content=small_body)
+            assert response.status_code == 200
+            assert call_count == 1
 
-        # Small body should succeed
-        small_body = "x" * 30
-        response = client.post("/mcp", content=small_body)
-        assert response.status_code == 200
-        assert call_count == 1
+            # Large body should fail
+            large_body = "x" * 100
+            response = client.post("/mcp", content=large_body)
+            assert response.status_code == 413
+            assert call_count == 1  # Not incremented
 
-        # Large body should fail
-        large_body = "x" * 100
-        response = client.post("/mcp", content=large_body)
+    def test_invalid_content_length_is_ignored(self) -> None:
+        config = _create_security_config(max_body_size_bytes=10)
+
+        async def app(scope, receive, send):
+            response = JSONResponse({"status": "ok"})
+            await response(scope, receive, send)
+
+        middleware = PreAuthSecurityMiddleware(app, config)
+        with closing(TestClient(middleware)) as client:
+            response = client.post("/mcp", headers={"Content-Length": "not-a-number"}, content="x")
+            assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_stream_read_failure_returns_400(self) -> None:
+        config = _create_security_config(max_body_size_bytes=100)
+        middleware = PreAuthSecurityMiddleware(AsyncMock(), config)
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp",
+                "headers": [],
+            }
+        )
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                middleware,
+                "_check_body_size_streaming",
+                AsyncMock(side_effect=RuntimeError("stream fail")),
+            )
+            response = await middleware.dispatch(request, AsyncMock(return_value=JSONResponse({})))
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_streaming_body_size_branch_returns_413(self) -> None:
+        config = _create_security_config(max_body_size_bytes=10)
+        middleware = PreAuthSecurityMiddleware(AsyncMock(), config)
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp",
+                "headers": [(b"transfer-encoding", b"chunked")],
+            }
+        )
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                middleware,
+                "_check_body_size_streaming",
+                AsyncMock(return_value=20),
+            )
+            response = await middleware.dispatch(
+                request, AsyncMock(return_value=JSONResponse({"ok": True}))
+            )
         assert response.status_code == 413
-        assert call_count == 1  # Not incremented
+
+    @pytest.mark.asyncio
+    async def test_streaming_body_limit_exceeded_exception_returns_413(self) -> None:
+        config = _create_security_config(max_body_size_bytes=10)
+        middleware = PreAuthSecurityMiddleware(AsyncMock(), config)
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp",
+                "headers": [(b"transfer-encoding", b"chunked")],
+            }
+        )
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                middleware,
+                "_check_body_size_streaming",
+                AsyncMock(side_effect=BodySizeLimitExceeded("too big")),
+            )
+            response = await middleware.dispatch(
+                request, AsyncMock(return_value=JSONResponse({"ok": True}))
+            )
+        assert response.status_code == 413
+
+    def test_timeout_returns_504(self) -> None:
+        config = _create_security_config(request_timeout_seconds=0.001)
+
+        async def app(scope, receive, send):
+            await asyncio.sleep(0.01)
+            response = JSONResponse({"status": "late"})
+            await response(scope, receive, send)
+
+        middleware = PreAuthSecurityMiddleware(app, config)
+        middleware.rate_limiter = SlidingWindowRateLimiter()
+        with closing(TestClient(middleware)) as client:
+            response = client.get("/mcp")
+            assert response.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_check_body_size_streaming_sets_cached_body(self) -> None:
+        config = _create_security_config(max_body_size_bytes=100)
+        middleware = PreAuthSecurityMiddleware(AsyncMock(), config)
+
+        chunks = [
+            {"type": "http.request", "body": b"abc", "more_body": True},
+            {"type": "http.request", "body": b"def", "more_body": False},
+        ]
+
+        async def receive() -> dict:
+            return chunks.pop(0)
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp",
+                "headers": [],
+            },
+            receive=receive,
+        )
+        size = await middleware._check_body_size_streaming(request, 100)
+        assert size == 6
+        assert request._body == b"abcdef"
+
+    @pytest.mark.asyncio
+    async def test_check_body_size_streaming_raises_when_exceeded(self) -> None:
+        config = _create_security_config(max_body_size_bytes=10)
+        middleware = PreAuthSecurityMiddleware(AsyncMock(), config)
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp",
+                "headers": [],
+            },
+            receive=AsyncMock(
+                side_effect=[
+                    {"type": "http.request", "body": b"12345678901", "more_body": False},
+                ]
+            ),
+        )
+        with pytest.raises(BodySizeLimitExceeded):
+            await middleware._check_body_size_streaming(request, 10)
 
 
 class TestUserRateLimitMiddleware:
@@ -281,12 +466,11 @@ class TestUserRateLimitMiddleware:
             await response(scope, receive, send)
 
         middleware = UserRateLimitMiddleware(app, config)
-        client = TestClient(middleware)
-
-        # Without user_id, requests should not be user-rate-limited
-        for _ in range(10):
-            response = client.get("/mcp")
-            assert response.status_code == 200
+        with closing(TestClient(middleware)) as client:
+            # Without user_id, requests should not be user-rate-limited
+            for _ in range(10):
+                response = client.get("/mcp")
+                assert response.status_code == 200
 
         # All 10 requests should have gone through
         assert call_count == 10
@@ -303,12 +487,31 @@ class TestUserRateLimitMiddleware:
             await response(scope, receive, send)
 
         middleware = UserRateLimitMiddleware(app, config)
-        client = TestClient(middleware)
+        with closing(TestClient(middleware)) as client:
+            # Health endpoint should always work even with user_id
+            for _ in range(10):
+                response = client.get("/health")
+                assert response.status_code == 200
 
-        # Health endpoint should always work even with user_id
-        for _ in range(10):
-            response = client.get("/health")
-            assert response.status_code == 200
+    @pytest.mark.asyncio
+    async def test_user_rate_limit_exceeded(self) -> None:
+        config = _create_security_config(rate_limit_per_user=1)
+        middleware = UserRateLimitMiddleware(AsyncMock(), config)
+        middleware.rate_limiter = SlidingWindowRateLimiter()
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/mcp",
+                "headers": [],
+                "state": {"user_id": "u1"},
+            }
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"status": "ok"}))
+        first = await middleware.dispatch(request, call_next)
+        second = await middleware.dispatch(request, call_next)
+        assert first.status_code == 200
+        assert second.status_code == 429
 
 
 class TestMiddlewareOrder:
@@ -327,10 +530,7 @@ class TestMiddlewareOrder:
             nonlocal auth_called
             auth_called += 1
             # Simulate auth failure
-            response = JSONResponse(
-                status_code=401,
-                content={"error": "invalid_token"}
-            )
+            response = JSONResponse(status_code=401, content={"error": "invalid_token"})
             await response(scope, receive, send)
 
         async def count_preauth(scope, receive, send):
@@ -345,24 +545,23 @@ class TestMiddlewareOrder:
         # Reset the shared rate limiter for this test
         middleware.rate_limiter = SlidingWindowRateLimiter()
 
-        client = TestClient(middleware)
+        with closing(TestClient(middleware)) as client:
+            # First 2 requests hit auth (which fails)
+            response1 = client.get("/mcp")
+            assert response1.status_code == 401
+            assert preauth_called == 1
+            assert auth_called == 1
 
-        # First 2 requests hit auth (which fails)
-        response1 = client.get("/mcp")
-        assert response1.status_code == 401
-        assert preauth_called == 1
-        assert auth_called == 1
+            response2 = client.get("/mcp")
+            assert response2.status_code == 401
+            assert preauth_called == 2
+            assert auth_called == 2
 
-        response2 = client.get("/mcp")
-        assert response2.status_code == 401
-        assert preauth_called == 2
-        assert auth_called == 2
-
-        # 3rd request should be rate limited BEFORE reaching auth
-        response3 = client.get("/mcp")
-        assert response3.status_code == 429
+            # 3rd request should be rate limited BEFORE reaching auth
+            response3 = client.get("/mcp")
+            assert response3.status_code == 429
+            assert response3.json()["error"] == "rate_limit_exceeded"
         # When rate limited, the inner app (count_preauth) is NOT called
         # because PreAuthSecurityMiddleware returns early
         assert preauth_called == 2  # Inner app NOT called (rate limited)
         assert auth_called == 2  # Auth NOT called (rate limited)
-        assert response3.json()["error"] == "rate_limit_exceeded"

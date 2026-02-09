@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from aws_cli_mcp.utils.http import normalize_public_base_url
 
 
 class LoggingSettings(BaseModel):
@@ -77,6 +79,12 @@ class AuthSettings(BaseModel):
     )
 
     identity_center_region: str | None = Field(default=None)
+    rate_limit_per_user: int = Field(default=100, ge=1)
+    rate_limit_per_ip: int = Field(default=1000, ge=1)
+    max_body_size_mb: int = Field(default=10, ge=1)
+    max_header_size_kb: int = Field(default=8, ge=1)
+    request_timeout_seconds: float = Field(default=30.0, ge=0.1)
+    audit_enabled: bool = Field(default=True)
 
 
 class AWSSettings(BaseModel):
@@ -86,7 +94,7 @@ class AWSSettings(BaseModel):
 
 
 class ServerSettings(BaseModel):
-    host: str = Field(default="0.0.0.0")
+    host: str = Field(default="127.0.0.1")
     port: int = Field(default=8000, ge=1024, le=65535)
     instructions: str = Field(
         default=(
@@ -99,11 +107,25 @@ class ServerSettings(BaseModel):
         default=False,
         description="If True, skips the forced two-step confirmation for destructive operations.",
     )
-    transport_mode: str = Field(default="stdio")
+    transport_mode: Literal["stdio", "http", "remote"] = Field(default="stdio")
     http_allowed_origins: tuple[str, ...] = Field(default=())
     http_allow_missing_origin: bool = Field(default=True)
     http_enable_cors: bool = Field(default=False)
     http_trust_forwarded_headers: bool = Field(default=False)
+    public_base_url: str | None = Field(
+        default=None,
+        description=(
+            "Externally visible base URL used for OAuth/resource metadata in remote mode "
+            "(e.g. https://mcp.example.com)."
+        ),
+    )
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _validate_public_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_public_base_url(value)
 
 
 class Settings(BaseModel):
@@ -121,6 +143,7 @@ ENV_KEYS = {
     "auth_provider": "AUTH_PROVIDER",
     "host": "MCP_HOST",
     "port": "MCP_PORT",
+    "public_base_url": "MCP_PUBLIC_BASE_URL",
     "instructions": "MCP_INSTRUCTIONS",
     "require_approval": "MCP_REQUIRE_APPROVAL",
     "log_level": "LOG_LEVEL",
@@ -154,9 +177,16 @@ def _project_root() -> Path:
 
 def _resolve_path(path: str) -> str:
     candidate = Path(path)
+    root = _project_root().resolve()
     if candidate.is_absolute():
-        return str(candidate)
-    return str((_project_root() / candidate).resolve())
+        resolved = candidate.resolve()
+    else:
+        resolved = (root / candidate).resolve()
+    # Allow paths under project root or under the project's data directory
+    root_str = str(root)
+    if not (str(resolved).startswith(root_str + os.sep) or resolved == root):
+        raise ValueError(f"Path traversal detected: '{path}' resolves outside project root")
+    return str(resolved)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -170,7 +200,30 @@ def _env_int(key: str, default: int) -> int:
     value = os.getenv(key)
     if value is None or value.strip() == "":
         return default
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Invalid integer value for %s: %r, using default %d", key, value, default
+        )
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    value = os.getenv(key)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Invalid float value for %s: %r, using default %s", key, value, default
+        )
+        return default
 
 
 def load_settings() -> Settings:
@@ -182,14 +235,14 @@ def load_settings() -> Settings:
 @lru_cache(maxsize=1)
 def _load_settings_cached() -> Settings:
     load_dotenv(dotenv_path=_project_root() / ".env")
+    log_file_env = os.getenv(ENV_KEYS["log_file"])
+    idp_config_path_env = os.getenv("AUTH_IDP_CONFIG_PATH")
 
     settings_data: dict[str, object] = {
         "server": {
             "host": os.getenv(ENV_KEYS["host"], ServerSettings().host),
             "port": _env_int(ENV_KEYS["port"], ServerSettings().port),
-            "instructions": os.getenv(
-                ENV_KEYS["instructions"], ServerSettings().instructions
-            ),
+            "instructions": os.getenv(ENV_KEYS["instructions"], ServerSettings().instructions),
             "require_approval": _env_bool(
                 ENV_KEYS["require_approval"], ServerSettings().require_approval
             ),
@@ -213,14 +266,13 @@ def _load_settings_cached() -> Settings:
                 "HTTP_TRUST_FORWARDED_HEADERS",
                 ServerSettings().http_trust_forwarded_headers,
             ),
+            "public_base_url": (
+                os.getenv(ENV_KEYS["public_base_url"], "").strip() or None
+            ),
         },
         "logging": {
             "level": os.getenv(ENV_KEYS["log_level"], LoggingSettings().level),
-            "file": (
-                _resolve_path(os.getenv(ENV_KEYS["log_file"]))
-                if os.getenv(ENV_KEYS["log_file"])
-                else None
-            ),
+            "file": _resolve_path(log_file_env) if log_file_env else None,
         },
         "execution": {
             "sdk_timeout_seconds": _env_int(
@@ -246,9 +298,7 @@ def _load_settings_cached() -> Settings:
             ),
         },
         "policy": {
-            "path": _resolve_path(
-                os.getenv(ENV_KEYS["policy_path"], PolicySettings().path)
-            ),
+            "path": _resolve_path(os.getenv(ENV_KEYS["policy_path"], PolicySettings().path)),
         },
         "smithy": {
             "model_path": _resolve_path(
@@ -270,11 +320,7 @@ def _load_settings_cached() -> Settings:
         },
         "auth": {
             "provider": os.getenv(ENV_KEYS["auth_provider"], AuthSettings().provider),
-            "idp_config_path": (
-                _resolve_path(os.getenv("AUTH_IDP_CONFIG_PATH"))
-                if os.getenv("AUTH_IDP_CONFIG_PATH")
-                else None
-            ),
+            "idp_config_path": _resolve_path(idp_config_path_env) if idp_config_path_env else None,
             "credential_refresh_buffer_seconds": _env_int(
                 "AUTH_CREDENTIAL_REFRESH_BUFFER_SECONDS",
                 AuthSettings().credential_refresh_buffer_seconds,
@@ -290,19 +336,52 @@ def _load_settings_cached() -> Settings:
             "identity_center_region": os.getenv(
                 "AUTH_IDENTITY_CENTER_REGION", AuthSettings().identity_center_region
             ),
+            "rate_limit_per_user": _env_int(
+                "AUTH_RATE_LIMIT_PER_USER",
+                AuthSettings().rate_limit_per_user,
+            ),
+            "rate_limit_per_ip": _env_int(
+                "AUTH_RATE_LIMIT_PER_IP",
+                AuthSettings().rate_limit_per_ip,
+            ),
+            "max_body_size_mb": _env_int(
+                "AUTH_MAX_BODY_SIZE_MB",
+                AuthSettings().max_body_size_mb,
+            ),
+            "max_header_size_kb": _env_int(
+                "AUTH_MAX_HEADER_SIZE_KB",
+                AuthSettings().max_header_size_kb,
+            ),
+            "request_timeout_seconds": _env_float(
+                "AUTH_REQUEST_TIMEOUT_SECONDS",
+                AuthSettings().request_timeout_seconds,
+            ),
+            "audit_enabled": _env_bool(
+                "AUTH_AUDIT_ENABLED",
+                AuthSettings().audit_enabled,
+            ),
         },
         "aws": {
             "default_region": os.getenv("AWS_REGION") or os.getenv(ENV_KEYS["aws_region"]),
             "default_profile": os.getenv(ENV_KEYS["aws_profile"]),
             "sts_region": os.getenv("AWS_STS_REGION", AWSSettings().sts_region),
         },
-
     }
 
     try:
-        settings = Settings(**settings_data)
+        settings = Settings.model_validate(settings_data)
     except ValidationError as exc:
         raise RuntimeError(f"Invalid configuration: {exc}") from exc
+
+    if (
+        settings.server.transport_mode.strip().lower() == "remote"
+        and settings.auth.provider == "multi-idp"
+        and not settings.server.public_base_url
+    ):
+        raise RuntimeError(
+            "Invalid configuration: MCP_PUBLIC_BASE_URL is required for "
+            "TRANSPORT_MODE=remote with AUTH_PROVIDER=multi-idp"
+        )
 
     Path(settings.storage.artifact_path).mkdir(parents=True, exist_ok=True)
     Path(settings.storage.sqlite_path).parent.mkdir(parents=True, exist_ok=True)

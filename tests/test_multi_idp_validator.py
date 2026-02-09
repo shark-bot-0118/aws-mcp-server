@@ -166,12 +166,19 @@ class TestIssuerValidation:
         with pytest.raises(TokenValidationError) as exc_info:
             await validator.validate(token)
 
-        assert exc_info.value.code == "unknown_issuer"
+        # Generic error code to prevent issuer enumeration via error differentiation.
+        assert exc_info.value.code == "invalid_token"
 
     def test_issuer_normalization(self) -> None:
         """Issuer should be normalized (trailing slash removed)."""
-        assert MultiIdPValidator._normalize_issuer("https://test.example.com/") == "https://test.example.com"
-        assert MultiIdPValidator._normalize_issuer("https://test.example.com") == "https://test.example.com"
+        assert (
+            MultiIdPValidator._normalize_issuer("https://test.example.com/")
+            == "https://test.example.com"
+        )
+        assert (
+            MultiIdPValidator._normalize_issuer("https://test.example.com")
+            == "https://test.example.com"
+        )
 
     @pytest.mark.asyncio
     async def test_issuer_with_trailing_slash_matched(self) -> None:
@@ -410,7 +417,6 @@ class TestClaimsMapping:
                 ),
             ]
         )
-        validator = MultiIdPValidator(config)
 
         # Verify the claims mapping is stored correctly
         idp = config.get_idp_by_issuer("https://login.microsoftonline.com/tenant/v2.0")
@@ -454,6 +460,9 @@ class TestErrorCodes:
         with pytest.raises(TokenValidationError) as exc_info:
             await validator.validate(token)
         assert exc_info.value.code == "invalid_algorithm"
+
+        observed_codes = {"opaque_token_not_supported", "invalid_algorithm"}
+        assert observed_codes.issubset(expected_codes)
 
 
 class TestJWTFormatPadding:
@@ -600,3 +609,456 @@ class TestJWKKeyTypes:
 
         assert exc_info.value.code == "unsupported_key_type"
         assert "UNKNOWN" in str(exc_info.value)
+
+
+class TestJWKSClient:
+    """Tests for JWKSClient."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_jwks_loaded_caches(self) -> None:
+        """JWKS should be loaded and cached."""
+        from aws_cli_mcp.auth.multi_idp import JWKSClient
+
+        config = JWKSCacheConfig()
+        client = JWKSClient("https://test/jwks", config)
+
+        mock_jwks = {"keys": [{"kid": "1", "kty": "RSA", "n": "...", "e": "AQAB"}]}
+
+        with patch("httpx.AsyncClient.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: mock_jwks)
+            mock_get.return_value.raise_for_status = MagicMock()
+
+            await client._ensure_jwks_loaded()
+            assert client._jwks_data == mock_jwks
+
+            # Second call should use cache
+            await client._ensure_jwks_loaded()
+            assert mock_get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_signing_key_refresh_on_unknown_kid(self) -> None:
+        """Should refresh JWKS if kid not found."""
+        from aws_cli_mcp.auth.multi_idp import JWKSClient
+
+        config = JWKSCacheConfig()
+        client = JWKSClient("https://test/jwks", config)
+
+        # First fetch: key1
+        jwks1 = {"keys": [{"kid": "key1", "kty": "RSA", "n": "...", "e": "AQAB"}]}
+        # Second fetch: key1, key2
+        jwks2 = {
+            "keys": [
+                {"kid": "key1", "kty": "RSA", "n": "...", "e": "AQAB"},
+                {"kid": "key2", "kty": "RSA", "n": "...", "e": "AQAB"},
+            ]
+        }
+
+        with patch("httpx.AsyncClient.get") as mock_get:
+            mock_get.side_effect = [
+                MagicMock(status_code=200, json=lambda: jwks1),
+                MagicMock(status_code=200, json=lambda: jwks2),
+            ]
+
+            # Initial load
+            await client._ensure_jwks_loaded()
+
+            # Try to get key2 (not in jwks1)
+            # Should trigger refresh
+            with patch.object(client, "_jwk_to_key", return_value="mock_key_obj"):
+                key = await client.get_signing_key("key2")
+                assert key == "mock_key_obj"
+
+            assert mock_get.call_count == 2
+
+
+class TestSingleIdPValidator:
+    """Tests for SingleIdPValidator."""
+
+    @pytest.mark.asyncio
+    async def test_discovery_and_initialization(self) -> None:
+        """Should discover JWKS URI from OIDC config."""
+        from aws_cli_mcp.auth.multi_idp import SingleIdPValidator
+
+        idp = IdPConfig(name="test", issuer="https://iss", audience="aud")
+        cache_config = JWKSCacheConfig()
+        validator = SingleIdPValidator(idp, cache_config)
+
+        oidc_config = {"jwks_uri": "https://iss/jwks"}
+
+        with patch("httpx.AsyncClient.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: oidc_config)
+
+            await validator.initialize()
+
+            assert validator._jwks_uri == "https://iss/jwks"
+            assert validator._jwks_client is not None
+
+    @pytest.mark.asyncio
+    async def test_discovery_rejects_invalid_jwks_uri(self) -> None:
+        from aws_cli_mcp.auth.multi_idp import SingleIdPValidator
+
+        idp = IdPConfig(name="test", issuer="https://iss", audience="aud")
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+
+        with (
+            patch(
+                "httpx.AsyncClient.get",
+                return_value=MagicMock(status_code=200, json=lambda: {"jwks_uri": "https://iss/jwks"}),
+            ),
+            patch("aws_cli_mcp.auth.multi_idp.validate_oidc_url", side_effect=ValueError("invalid")),
+        ):
+            with pytest.raises(TokenValidationError) as exc_info:
+                await validator.initialize()
+
+        assert exc_info.value.code == "discovery_error"
+
+    @pytest.mark.asyncio
+    async def test_validate_token_calls_client(self) -> None:
+        """validate_token should call jwks_client.get_signing_key and jwt.decode."""
+        from aws_cli_mcp.auth.multi_idp import SingleIdPValidator
+
+        idp = IdPConfig(
+            name="test",
+            issuer="https://iss",
+            audience="aud",
+            allowed_algorithms=("RS256",),
+            jwks_uri="https://iss/jwks",  # Pre-set jwks_uri to skip discovery
+        )
+
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+
+        token = "header.payload.sig"
+        header = {"kid": "key1"}
+        claims = {"sub": "user"}
+
+        with (
+            patch(
+                "aws_cli_mcp.auth.multi_idp.JWKSClient.get_signing_key", new_callable=AsyncMock
+            ) as mock_get_key,
+            patch("jwt.decode") as mock_decode,
+        ):
+            mock_key = MagicMock()
+            mock_get_key.return_value = mock_key
+            mock_decode.return_value = {"valid": "claims"}
+
+            result = await validator.validate_token(token, header, claims)
+
+            mock_get_key.assert_awaited_with("key1")
+            mock_decode.assert_called_once()
+            assert result == {"valid": "claims"}
+
+
+class TestMultiIdPValidatorAdditionalCoverage:
+    @pytest.mark.asyncio
+    async def test_jwks_client_get_signing_key_error_paths(self) -> None:
+        from aws_cli_mcp.auth.multi_idp import JWKSClient
+
+        client = JWKSClient("https://jwks", JWKSCacheConfig())
+        with patch.object(client, "_ensure_jwks_loaded", new=AsyncMock()):
+            with pytest.raises(TokenValidationError, match="JWKS not available"):
+                await client.get_signing_key("kid")
+
+        client._jwks_data = {"keys": []}
+        with patch.object(client, "_ensure_jwks_loaded", new=AsyncMock()):
+            with pytest.raises(TokenValidationError, match="No keys"):
+                await client.get_signing_key("kid")
+
+        client._jwks_data = {"keys": [{"kid": "kid-a", "kty": "RSA"}]}
+        with (
+            patch.object(client, "_ensure_jwks_loaded", new=AsyncMock()),
+            patch.object(client, "_jwk_to_key", return_value="rsa-key"),
+        ):
+            assert await client.get_signing_key("kid-a") == "rsa-key"
+
+        client._jwks_data = {"keys": [{"kid": "kid-a", "kty": "RSA"}]}
+        with (
+            patch.object(client, "_ensure_jwks_loaded", new=AsyncMock()),
+            patch.object(client, "_jwk_to_key", return_value="first-key"),
+        ):
+            assert await client.get_signing_key(None) == "first-key"
+
+        client._jwks_data = {"keys": [{"kid": "kid-a", "kty": "RSA"}]}
+        with (
+            patch.object(client, "_ensure_jwks_loaded", new=AsyncMock()),
+            patch.object(client, "_refresh_jwks", new=AsyncMock()),
+        ):
+            with pytest.raises(TokenValidationError, match="not found"):
+                await client.get_signing_key("missing")
+
+    def test_jwks_okp_key_type(self) -> None:
+        from aws_cli_mcp.auth.multi_idp import JWKSClient
+
+        with patch("jwt.algorithms.OKPAlgorithm.from_jwk", return_value="okp-key"):
+            key = JWKSClient._jwk_to_key({"kty": "OKP", "crv": "Ed25519", "x": "abc", "kid": "k"})
+        assert key == "okp-key"
+
+    @pytest.mark.asyncio
+    async def test_jwks_refresh_and_retry_branches(self) -> None:
+        from aws_cli_mcp.auth.multi_idp import JWKSClient
+
+        config = JWKSCacheConfig(
+            ttl_seconds=10, refresh_before_seconds=2, failure_backoff_seconds=60
+        )
+        client = JWKSClient("https://jwks", config)
+        client._jwks_data = {"keys": [{"kid": "k"}]}
+        client._last_fetch = None
+        assert client._should_refresh() is True
+
+        client._last_failure = datetime.now(timezone.utc)
+        assert await client._can_retry() is False
+
+        with patch.object(client, "_can_retry", new=AsyncMock(return_value=False)):
+            await client._refresh_jwks(force=False)
+
+        client2 = JWKSClient("https://jwks", JWKSCacheConfig(max_retries=1))
+        with patch("httpx.AsyncClient.get", side_effect=RuntimeError("boom")):
+            with pytest.raises(TokenValidationError, match="JWKS fetch failed"):
+                await client2._refresh_jwks(force=True)
+
+    @pytest.mark.asyncio
+    async def test_single_validator_init_and_discovery_branches(self) -> None:
+        from aws_cli_mcp.auth.multi_idp import SingleIdPValidator
+
+        idp = IdPConfig(name="x", issuer="https://iss", audience="aud")
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+
+        validator._initialized = True
+        await validator.initialize()  # early return branch
+
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+
+        class _Lock:
+            async def __aenter__(self):
+                validator._initialized = True
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        validator._init_lock = _Lock()  # type: ignore[assignment]
+        await validator.initialize()  # lock branch return
+
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+        bad_resp = MagicMock()
+        bad_resp.raise_for_status = MagicMock()
+        bad_resp.json.return_value = {}
+        with patch("httpx.AsyncClient.get", return_value=bad_resp):
+            with pytest.raises(TokenValidationError, match="Missing jwks_uri"):
+                await validator._discover_jwks_uri()
+
+    @pytest.mark.asyncio
+    async def test_single_validator_validate_token_error_paths(self) -> None:
+        import jwt
+
+        from aws_cli_mcp.auth.multi_idp import SingleIdPValidator
+
+        idp = IdPConfig(
+            name="x", issuer="https://iss", audience="aud", allowed_algorithms=("RS256",)
+        )
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+        validator._initialized = True
+        validator._jwks_client = None
+
+        with pytest.raises(TokenValidationError, match="Validator not initialized"):
+            await validator.validate_token("t", {}, {})
+
+        validator._jwks_client = MagicMock()
+        validator._jwks_client.get_signing_key = AsyncMock(side_effect=RuntimeError("boom"))
+        with pytest.raises(TokenValidationError, match="Failed to get signing key"):
+            await validator.validate_token("t", {"kid": "k"}, {})
+
+        validator._jwks_client.get_signing_key = AsyncMock(return_value="k")
+        cases = [
+            (jwt.ExpiredSignatureError("e"), "token_expired"),
+            (jwt.InvalidAudienceError("e"), "invalid_audience"),
+            (jwt.InvalidIssuerError("e"), "invalid_issuer"),
+            (jwt.ImmatureSignatureError("e"), "token_immature"),
+            (jwt.InvalidTokenError("e"), "invalid_token"),
+        ]
+        for exc, code in cases:
+            with patch("jwt.decode", side_effect=exc):
+                with pytest.raises(TokenValidationError) as info:
+                    await validator.validate_token("token", {"kid": "k"}, {})
+                assert info.value.code == code
+
+    @pytest.mark.asyncio
+    async def test_single_validator_re_raises_token_validation_error(self) -> None:
+        from aws_cli_mcp.auth.multi_idp import SingleIdPValidator
+
+        idp = IdPConfig(
+            name="x", issuer="https://iss", audience="aud", allowed_algorithms=("RS256",)
+        )
+        validator = SingleIdPValidator(idp, JWKSCacheConfig())
+        validator._initialized = True
+        validator._jwks_client = MagicMock()
+        validator._jwks_client.get_signing_key = AsyncMock(
+            side_effect=TokenValidationError("bad key", "jwks_error")
+        )
+        with pytest.raises(TokenValidationError) as info:
+            await validator.validate_token("token", {"kid": "k"}, {})
+        assert info.value.code == "jwks_error"
+
+    def test_validate_audience_invalid_type(self) -> None:
+        validator = MultiIdPValidator(_create_config())
+        assert validator._validate_audience_or_azp({"aud": 123}, {"x"}) is False
+        assert validator._validate_audience_or_azp({"aud": ["x", {"bad": "shape"}]}, {"x"}) is True
+        assert validator._validate_audience_or_azp({"aud": [{"bad": "shape"}]}, {"x"}) is False
+        assert validator._validate_audience_or_azp({"azp": {"bad": "shape"}}, {"x"}) is False
+        assert validator._validate_audience_or_azp({"aud": "x", "azp": {"bad": "shape"}}, {"x"}) is False
+
+    def test_extract_claims_branches(self) -> None:
+        config = _create_config(
+            [
+                IdPConfig(
+                    name="idp",
+                    issuer="https://iss",
+                    audience="aud",
+                    claims_mapping={"user_id": "uid", "email": "mail", "groups": "groups"},
+                )
+            ]
+        )
+        validator = MultiIdPValidator(config)
+        idp = config.idps[0]
+
+        claims = {
+            "uid": "u1",
+            "sub": "sub1",
+            "mail": "a@b.com",
+            "groups": ["g1", "g2"],
+            "exp": int(time.time()) + 3600,
+            "jti": "j1",
+        }
+        extracted = validator._extract_claims(claims, idp)
+        assert extracted.user_id == "u1"
+        assert extracted.groups == ("g1", "g2")
+
+        claims["groups"] = "solo"
+        extracted2 = validator._extract_claims(claims, idp)
+        assert extracted2.groups == ("solo",)
+
+        with pytest.raises(TokenValidationError, match="Could not determine user_id"):
+            validator._extract_claims({"sub": "", "exp": int(time.time()) + 1}, idp)
+
+        with pytest.raises(TokenValidationError, match="Invalid exp claim format"):
+            validator._extract_claims({"sub": "u", "exp": "bad"}, idp)
+
+    @pytest.mark.asyncio
+    async def test_validate_header_and_payload_decode_errors(self) -> None:
+        config = _create_config()
+        validator = MultiIdPValidator(config)
+        token = _create_jwt(
+            {"alg": "RS256"},
+            {
+                "iss": "https://test.example.com",
+                "sub": "u",
+                "aud": "test-audience",
+                "exp": int(time.time()) + 3600,
+            },
+        )
+
+        import jwt
+
+        with patch(
+            "jwt.get_unverified_header", side_effect=jwt.exceptions.DecodeError("bad header")
+        ):
+            with pytest.raises(TokenValidationError, match="Invalid token header"):
+                await validator.validate(token)
+
+        with (
+            patch("jwt.get_unverified_header", return_value={"alg": "RS256"}),
+            patch("jwt.decode", side_effect=jwt.exceptions.DecodeError("bad payload")),
+        ):
+            with pytest.raises(TokenValidationError, match="Invalid token payload"):
+                await validator.validate(token)
+
+    @pytest.mark.asyncio
+    async def test_validate_other_error_paths(self) -> None:
+        config = _create_config()
+        validator = MultiIdPValidator(config)
+        issuer = "https://test.example.com"
+        valid_payload = {
+            "iss": issuer,
+            "sub": "u",
+            "aud": "test-audience",
+            "exp": int(time.time()) + 3600,
+        }
+        token = _create_jwt({"alg": "RS256"}, valid_payload)
+
+        with patch.object(validator.config, "get_idp_by_issuer", return_value=None):
+            with pytest.raises(TokenValidationError) as info:
+                await validator.validate(token)
+            assert info.value.code == "unknown_issuer"
+
+        validator_internal = MultiIdPValidator(_create_config())
+        validator_internal._validators = {}
+        with pytest.raises(TokenValidationError) as info:
+            await validator_internal.validate(token)
+        assert info.value.code == "internal_error"
+
+        validator_alg = MultiIdPValidator(_create_config())
+        bad_alg_token = _create_jwt({"alg": "HS256"}, valid_payload)
+        with pytest.raises(TokenValidationError) as info:
+            await validator_alg.validate(bad_alg_token)
+        assert info.value.code == "invalid_algorithm"
+
+        validator_aud = MultiIdPValidator(_create_config())
+        invalid_aud = dict(valid_payload)
+        invalid_aud["aud"] = "other"
+        invalid_aud_token = _create_jwt({"alg": "RS256"}, invalid_aud)
+        with pytest.raises(TokenValidationError) as info:
+            await validator_aud.validate(invalid_aud_token)
+        assert info.value.code == "invalid_audience"
+
+    @pytest.mark.asyncio
+    async def test_validate_success_path(self) -> None:
+        config = _create_config()
+        validator = MultiIdPValidator(config)
+        issuer = "https://test.example.com"
+        token = _create_jwt(
+            {"alg": "RS256", "kid": "k1"},
+            {
+                "iss": issuer,
+                "sub": "u1",
+                "aud": "test-audience",
+                "exp": int(time.time()) + 3600,
+                "email": "a@b.com",
+            },
+        )
+        fake_single = AsyncMock()
+        fake_single.validate_token.return_value = {
+            "iss": issuer,
+            "sub": "u1",
+            "aud": "test-audience",
+            "exp": int(time.time()) + 3600,
+            "email": "a@b.com",
+        }
+        validator._validators[issuer] = fake_single
+
+        claims = await validator.validate(token)
+        assert claims.user_id == "u1"
+        assert claims.email == "a@b.com"
+
+
+class TestJWKSRetryBackoff:
+    """Tests for JWKS exponential backoff on retry."""
+
+    @pytest.mark.asyncio
+    async def test_jwks_refresh_retries_with_backoff_sleep(self) -> None:
+        """_refresh_jwks should sleep between retries with exponential backoff."""
+        from aws_cli_mcp.auth.multi_idp import JWKSClient
+
+        config = JWKSCacheConfig(max_retries=3)
+        client = JWKSClient("https://jwks", config)
+
+        with (
+            patch("httpx.AsyncClient.get", side_effect=RuntimeError("network error")),
+            patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            with pytest.raises(TokenValidationError, match="JWKS fetch failed"):
+                await client._refresh_jwks(force=True)
+
+            # Should have slept between attempt 0->1 and 1->2, but not after last attempt
+            assert mock_sleep.call_count == 2
+            # Verify exponential backoff: min(2**0, 30)=1, min(2**1, 30)=2
+            mock_sleep.assert_any_call(1)
+            mock_sleep.assert_any_call(2)

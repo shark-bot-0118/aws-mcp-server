@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # pragma: no cover
 
 from aws_cli_mcp import __version__
 from aws_cli_mcp.config import load_settings
@@ -29,7 +29,7 @@ def build_server() -> MCPServer:
         version=__version__,
         instructions=settings.server.instructions,
     )
-    
+
     # Re-configure logging AFTER FastMCP init to ensure our handlers (FileHandler) persist
     configure_logging()
 
@@ -47,36 +47,52 @@ def run_entrypoint() -> None:
     if _is_http_transport(settings.server.transport_mode):
         _run_http()
         return
-    server = build_server()
-    server.run()
+    get_server().run()
 
 
 def _run_http() -> None:
     settings = load_settings()
+    configure_logging()
     from aws_cli_mcp.transport.http_server import create_http_app
 
     try:
-        import uvicorn  # type: ignore
+        import uvicorn
     except Exception as exc:
         raise RuntimeError("uvicorn is required for HTTP transport mode") from exc
 
     app = create_http_app()
-    uvicorn.run(app, host=settings.server.host, port=settings.server.port)
+    # This server uses MCP over HTTP and does not expose websocket endpoints.
+    uvicorn.run(
+        app,
+        host=settings.server.host,
+        port=settings.server.port,
+        ws="none",
+        log_config=None,
+    )
 
 
-def _module_init() -> MCPServer | None:
-    """Initialise the module-level server instance.
+_server: MCPServer | None = None
 
-    Separated from bare module scope so the side-effect (loading settings,
-    building a server) is explicit and testable.
+
+def get_server() -> MCPServer:
+    """Lazily initialise and return the module-level server instance.
+
+    Unlike the previous ``_module_init()`` approach this does NOT execute
+    ``load_settings()`` / ``build_server()`` at import time, which improves
+    testability and avoids circular-import risks.
     """
+    global _server
+    if _server is None:
+        _server = build_server()
+    return _server
+
+
+# Keep for backward compatibility – tests import this.
+def _module_init() -> MCPServer | None:
     _settings = load_settings()
     if _is_http_transport(_settings.server.transport_mode):
         return None
     return build_server()
-
-
-server = _module_init()
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -84,6 +100,4 @@ if __name__ == "__main__":  # pragma: no cover
     if _is_http_transport(_settings.server.transport_mode):
         _run_http()
     else:
-        if server is None:
-            server = build_server()
-        server.run()
+        get_server().run()

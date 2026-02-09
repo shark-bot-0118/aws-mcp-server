@@ -14,12 +14,14 @@ import base64
 import json
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import ParamSpec, TypeVar
 from uuid import uuid4
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from aws_cli_mcp.app import get_app_context
+from aws_cli_mcp.app import AppContext, get_app_context
 from aws_cli_mcp.audit.models import AuditOpRecord, AuditTxRecord
 from aws_cli_mcp.auth.context import (
     AWSCredentials,
@@ -27,7 +29,9 @@ from aws_cli_mcp.auth.context import (
     update_request_context,
 )
 from aws_cli_mcp.aws_credentials.identity_center import (
+    AccountEntry,
     IdentityCenterError,
+    RoleEntry,
     get_identity_center_provider,
 )
 from aws_cli_mcp.domain.operations import OperationRef
@@ -62,6 +66,7 @@ SEARCH_SCHEMA = {
         "query": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 256,
             "description": (
                 "Search keywords to match against operation names or descriptions. "
                 "Supports multiple keywords separated by space (e.g., 'lambda list'). "
@@ -70,6 +75,7 @@ SEARCH_SCHEMA = {
         },
         "serviceHint": {
             "type": "string",
+            "maxLength": 128,
             "description": (
                 "AWS service name in lowercase. Examples: 'lambda', 'ec2', 's3', 'iam', "
                 "'dynamodb', 'sqs', 'sns', etc. If omitted, searches across all allowed services."
@@ -93,6 +99,7 @@ GET_SCHEMA_SCHEMA = {
         "service": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 128,
             "description": (
                 "AWS service name in lowercase. Examples: 'lambda', 's3', 'ec2', 'iam'. "
                 "Use the exact service name returned from aws_search_operations."
@@ -101,6 +108,7 @@ GET_SCHEMA_SCHEMA = {
         "operation": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 128,
             "description": (
                 "AWS operation name. supports PascalCase (e.g. 'ListFunctions'), "
                 "or kebab-case/snake_case (e.g. 'list-functions', 'list_functions'). "
@@ -127,6 +135,7 @@ EXECUTE_SCHEMA = {
         "service": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 128,
             "description": (
                 "AWS service name in lowercase. Examples: 'lambda', 's3', 'ec2', 'iam'. "
                 "Must match the service name from aws_search_operations "
@@ -136,6 +145,7 @@ EXECUTE_SCHEMA = {
         "operation": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 128,
             "description": (
                 "AWS operation name. supports PascalCase (e.g. 'ListFunctions'), "
                 "or kebab-case/snake_case (e.g. 'list-functions', 'list_functions'). "
@@ -147,7 +157,7 @@ EXECUTE_SCHEMA = {
             "description": (
                 "Operation parameters as a JSON object (or JSON string). "
                 "Use aws_get_operation_schema to see required/optional fields. "
-                "Example for Lambda Invoke: {\"FunctionName\": \"my-function\"}. "
+                'Example for Lambda Invoke: {"FunctionName": "my-function"}. '
                 "Use {} for operations with no required parameters."
             ),
         },
@@ -164,7 +174,9 @@ EXECUTE_SCHEMA = {
                 "Execution options. For Identity Center, specify accountId + roleName "
                 "(or roleArn) to select the role. Example: "
                 "{'accountId': '123456789012', 'roleName': 'ReadOnly'}. "
-                "Other options include confirmationToken for destructive operations."
+                "Other options include confirmationToken for destructive operations. "
+                "For large responses, responseMode ('auto'|'compact'|'full'), "
+                "maxResultItems (int), and omitResponseFields (string array) are supported."
             ),
         },
     },
@@ -172,14 +184,22 @@ EXECUTE_SCHEMA = {
     "additionalProperties": False,
 }
 
+P = ParamSpec("P")
+T = TypeVar("T")
 
-async def _run_blocking(ctx, func, *args, **kwargs):
+
+async def _run_blocking(
+    ctx: AppContext,
+    func: Callable[P, T],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> T:
     if ctx.settings.server.transport_mode in {"http", "remote"}:
         return await asyncio.to_thread(func, *args, **kwargs)
     return func(*args, **kwargs)
 
 
-def _is_exposed(ctx, op_ref: OperationRef) -> bool:
+def _is_exposed(ctx: AppContext, op_ref: OperationRef) -> bool:
     """Check if an operation is exposed based on policy only."""
     if not ctx.policy_engine.is_service_allowed(op_ref.service):
         return False
@@ -195,10 +215,17 @@ def search_operations(payload: dict[str, object]) -> ToolResult:
     ctx = get_app_context()
 
     query = str(payload["query"])
-    service_hint = payload.get("serviceHint")
-    if service_hint:
-        service_hint = str(service_hint).lower()
-    limit = int(payload.get("limit", 20))
+    raw_service_hint = payload.get("serviceHint")
+    service_hint: str | None = None
+    if isinstance(raw_service_hint, str) and raw_service_hint.strip():
+        service_hint = raw_service_hint.lower()
+    raw_limit = payload.get("limit", 20)
+    if isinstance(raw_limit, bool):
+        limit = 20
+    elif isinstance(raw_limit, (int, str)):
+        limit = int(raw_limit)
+    else:
+        limit = 20
     snapshot = load_model_snapshot()
 
     matches = snapshot.catalog.search(query, service=service_hint)
@@ -211,24 +238,26 @@ def search_operations(payload: dict[str, object]) -> ToolResult:
         if not _is_exposed(ctx, op_ref):
             continue
         risk = ctx.policy_engine.risk_for_operation(op_ref)
-        results.append({
-            "service": op_ref.service,
-            "operation": op_ref.operation,
-            "summary": entry.documentation,
-            "risk": risk,
-            "tool_helpers": {
-                "get_schema": {
-                    "service": op_ref.service,
-                    "operation": op_ref.operation,
+        results.append(
+            {
+                "service": op_ref.service,
+                "operation": op_ref.operation,
+                "summary": entry.documentation,
+                "risk": risk,
+                "tool_helpers": {
+                    "get_schema": {
+                        "service": op_ref.service,
+                        "operation": op_ref.operation,
+                    },
+                    "execute_template": {
+                        "action": "validate",
+                        "service": op_ref.service,
+                        "operation": op_ref.operation,
+                        "payload": {},
+                    },
                 },
-                "execute_template": {
-                    "action": "validate",
-                    "service": op_ref.service,
-                    "operation": op_ref.operation,
-                    "payload": {},
-                },
-            },
-        })
+            }
+        )
 
     return result_from_payload({"count": len(results), "results": results})
 
@@ -248,6 +277,7 @@ def get_operation_schema(payload: dict[str, object]) -> ToolResult:
     entry = snapshot.catalog.find_operation(service, operation)
     if not entry:
         raise ValueError(f"Operation not found: {service}:{operation}")
+    service, operation = _resolve_catalog_operation(entry, service, operation)
 
     op_ref = OperationRef(service=service, operation=operation)
     if not _is_exposed(ctx, op_ref):
@@ -274,7 +304,7 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
     """
     validate_or_raise(EXECUTE_SCHEMA, payload)
     ctx = get_app_context()
-    
+
     # Lazy cleanup of expired pending confirmation tokens (1 hour TTL)
     try:
         await _run_blocking(
@@ -297,9 +327,12 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
         return raw_payload
     op_payload = dict(raw_payload) if raw_payload else {}
 
-    region = payload.get("region")
+    raw_region = payload.get("region")
+    region = raw_region if isinstance(raw_region, str) and raw_region.strip() else None
 
     raw_options = _parse_json_arg(payload.get("options"), "options")
+    if isinstance(raw_options, ToolResult):
+        return raw_options
     options = dict(raw_options) if raw_options else {}
 
     entry = snapshot.catalog.find_operation(service, operation)
@@ -309,6 +342,7 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
             f"Operation not found: {service}:{operation}",
             hint="Use aws_search_operations to find valid operations.",
         )
+    service, operation = _resolve_catalog_operation(entry, service, operation)
 
     op_ref = OperationRef(service=service, operation=operation)
     if not _is_exposed(ctx, op_ref):
@@ -375,14 +409,40 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
         selected_account_id, selected_role_name = selection
         role_context = {"accountId": selected_account_id, "roleName": selected_role_name}
 
-    # Destructive operation check & Auto-approval check
-    is_destructive = policy_decision.require_approval
-    auto_approve = ctx.settings.server.auto_approve_destructive
+    policy_requires_confirmation = (
+        policy_decision.require_approval
+        if isinstance(policy_decision.require_approval, bool)
+        else False
+    )
+    server_require_approval = ctx.settings.server.require_approval
+    global_requires_confirmation = (
+        server_require_approval if isinstance(server_require_approval, bool) else False
+    )
+    destructive_flag = getattr(policy_decision, "require_approval_for_destructive", False)
+    destructive_policy_requirement = (
+        destructive_flag if isinstance(destructive_flag, bool) else False
+    )
+    risk_flag = getattr(policy_decision, "require_approval_for_risk", False)
+    risk_policy_requirement = risk_flag if isinstance(risk_flag, bool) else False
+    auto_approve_raw = ctx.settings.server.auto_approve_destructive
+    auto_approve_destructive = auto_approve_raw if isinstance(auto_approve_raw, bool) else False
+    requires_confirmation = global_requires_confirmation or policy_requires_confirmation
+    destructive_auto_approved = (
+        auto_approve_destructive
+        and destructive_policy_requirement
+        and not risk_policy_requirement
+        and not global_requires_confirmation
+    )
 
     # Token from options
-    confirmation_token = options.get("confirmationToken")
+    raw_confirmation_token = options.get("confirmationToken")
+    confirmation_token = (
+        raw_confirmation_token
+        if isinstance(raw_confirmation_token, str) and raw_confirmation_token.strip()
+        else None
+    )
 
-    if is_destructive and not auto_approve:
+    if requires_confirmation and not destructive_auto_approved:
         # Case 1: Token provided -> Validate and Execute
         if confirmation_token:
             # Look up the pending transaction
@@ -403,7 +463,14 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
                 )
 
             current_actor = _actor_from_request_context()
-            if not current_actor or pending_tx.actor != current_actor:
+            # In stdio mode both actors are None — allow the match.
+            if current_actor is None and pending_tx.actor is not None:
+                return _error_response(
+                    "InvalidConfirmationToken",
+                    "The confirmation token does not belong to this authenticated user.",
+                    hint="Please re-run the command without a token to get a new one.",
+                )
+            if current_actor is not None and pending_tx.actor != current_actor:
                 return _error_response(
                     "InvalidConfirmationToken",
                     "The confirmation token does not belong to this authenticated user.",
@@ -434,23 +501,36 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
                     hint="Please re-run the command without a token to get a new one.",
                 )
 
-            # Update status to 'Started' to mark as consumed
-            await _run_blocking(
+            # Atomically claim the token (UPDATE … WHERE status='PendingConfirmation').
+            # If another concurrent request already consumed this token, claim
+            # returns False and we reject the duplicate.
+            claimed = await _run_blocking(
                 ctx,
-                ctx.store.update_tx_status,
+                ctx.store.claim_pending_tx,
                 confirmation_token,
-                "Started",
-                None,
             )
-            
+            if not claimed:
+                return _error_response(
+                    "InvalidConfirmationToken",
+                    "This token has already been used or is not in a pending state.",
+                )
+
             tx_id = confirmation_token
             op_id = uuid4().hex
-            
+
             # Destructive execution phase
             await _record_audit_log(
-                ctx, tx_id, op_id, service, operation, op_payload,
-                status="Started", region=region, is_new_tx=False,
-                model=snapshot.model, operation_shape_id=entry.operation_shape_id,
+                ctx,
+                tx_id,
+                op_id,
+                service,
+                operation,
+                op_payload,
+                status="Started",
+                region=region,
+                is_new_tx=False,
+                model=snapshot.model,
+                operation_shape_id=entry.operation_shape_id,
                 request_context=role_context,
             )
 
@@ -458,16 +538,37 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
         else:
             tx_id = uuid4().hex.upper()
             op_id = uuid4().hex
-            
+
             await _record_audit_log(
-                ctx, tx_id, op_id, service, operation, op_payload,
-                status="PendingConfirmation", region=region, is_new_tx=True,
-                model=snapshot.model, operation_shape_id=entry.operation_shape_id,
+                ctx,
+                tx_id,
+                op_id,
+                service,
+                operation,
+                op_payload,
+                status="PendingConfirmation",
+                region=region,
+                is_new_tx=True,
+                model=snapshot.model,
+                operation_shape_id=entry.operation_shape_id,
                 request_context=role_context,
             )
 
+            approval_sources: list[str] = []
+            if global_requires_confirmation:
+                approval_sources.append("server")
+            if destructive_policy_requirement:
+                approval_sources.append("policy:destructive")
+            if risk_policy_requirement:
+                risk_name = (
+                    policy_decision.risk if isinstance(policy_decision.risk, str) else "unknown"
+                )
+                approval_sources.append(f"policy:risk:{risk_name}")
+            if not approval_sources and policy_requires_confirmation:
+                approval_sources.append("policy")
+
             hint_msg = (
-                "SECURITY CHECK: Destructive operation detected. "
+                "SECURITY CHECK: Confirmation required before execution. "
                 "1. SHOW the user 'Service', 'Operation', 'Target' from 'reasons' field below. "
                 "2. ASK the user for explicit confirmation. "
                 "3. IF confirmed, re-run the exact same command with "
@@ -475,25 +576,34 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
             )
             return _error_response(
                 "ConfirmationRequired",
-                "Destructive operation requires confirmation.",
+                "Operation requires confirmation.",
                 hint=hint_msg,
                 reasons=[
                     f"Token: {tx_id}",
+                    f"ApprovalSource: {', '.join(approval_sources)}",
                     f"Service: {service}",
                     f"Operation: {operation}",
                     f"Target: {json.dumps(_redact(op_payload))}",
                     f"Role: {role_context}" if role_context else "Role: (not specified)",
-                ]
+                ],
             )
     else:
-        # Non-destructive or Auto-approve -> Start new Tx
+        # Confirmation not required or safely auto-approved -> Start new Tx
         tx_id = uuid4().hex
         op_id = uuid4().hex
-        
+
         await _record_audit_log(
-            ctx, tx_id, op_id, service, operation, op_payload,
-            status="Started", region=region, is_new_tx=True,
-            model=snapshot.model, operation_shape_id=entry.operation_shape_id,
+            ctx,
+            tx_id,
+            op_id,
+            service,
+            operation,
+            op_payload,
+            status="Started",
+            region=region,
+            is_new_tx=True,
+            model=snapshot.model,
+            operation_shape_id=entry.operation_shape_id,
             request_context=role_context,
         )
 
@@ -532,8 +642,11 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
     # Coerce payload types (blob base64, numeric/boolean conversion, etc.)
     try:
         coerced_payload = _coerce_payload_types(
-            snapshot.model, entry.operation_shape_id, payload_with_tokens,
-            service=service, operation=operation,
+            snapshot.model,
+            entry.operation_shape_id,
+            payload_with_tokens,
+            service=service,
+            operation=operation,
         )
     except ValueError as e:
         return _error_response(
@@ -571,6 +684,8 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
             backoff = 0.5 * (2**attempt)
             await asyncio.sleep(backoff)
             attempt += 1
+        except (KeyboardInterrupt, SystemExit, MemoryError):
+            raise
         except Exception as exc:
             error_message = str(exc)
             break
@@ -585,9 +700,12 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
         limited_redacted_response = _limit_result_payload(
             redacted_response if isinstance(redacted_response, dict) else {},
             ctx.settings.execution.max_output_characters,
+            service=service,
+            operation=operation,
+            options=options,
         )
         response_summary = _truncate_json(limited_redacted_response, 2000)
-        
+
         response_artifact = await _run_blocking(
             ctx,
             ctx.artifacts.write_json,
@@ -602,9 +720,7 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
     await _run_blocking(
         ctx, ctx.store.update_op_status, op_id, status, duration_ms, error_message, response_summary
     )
-    await _run_blocking(
-        ctx, ctx.store.update_tx_status, tx_id, status, completed_at=utc_now_iso()
-    )
+    await _run_blocking(ctx, ctx.store.update_tx_status, tx_id, status, completed_at=utc_now_iso())
 
     if error_message:
         return result_from_payload(
@@ -625,6 +741,9 @@ async def execute_operation(payload: dict[str, object]) -> ToolResult:
     limited_result = _limit_result_payload(
         response_payload if isinstance(response_payload, dict) else {},
         ctx.settings.execution.max_output_characters,
+        service=service,
+        operation=operation,
+        options=options,
     )
     return result_from_payload(
         {
@@ -660,6 +779,27 @@ def _error_response(
     return result_from_payload({"error": error})
 
 
+def _resolve_catalog_operation(
+    entry: object,
+    service: str,
+    operation: str,
+) -> tuple[str, str]:
+    """Resolve canonical service/operation from catalog entry when available."""
+    ref = getattr(entry, "ref", None)
+    if isinstance(ref, OperationRef):
+        return ref.service, ref.operation
+
+    resolved_service = service
+    resolved_operation = operation
+    candidate_service = getattr(ref, "service", None)
+    candidate_operation = getattr(ref, "operation", None)
+    if isinstance(candidate_service, str) and candidate_service:
+        resolved_service = candidate_service
+    if isinstance(candidate_operation, str) and candidate_operation:
+        resolved_operation = candidate_operation
+    return resolved_service, resolved_operation
+
+
 def _compute_request_hash(
     payload: dict[str, object],
     context: dict[str, object] | None = None,
@@ -679,7 +819,7 @@ def _compute_request_hash(
     return sha256_text(normalized)
 
 
-def _identity_center_enabled(ctx) -> bool:
+def _identity_center_enabled(ctx: AppContext) -> bool:
     return ctx.settings.auth.provider.lower() == "identity-center"
 
 
@@ -691,7 +831,7 @@ def _actor_from_request_context() -> str | None:
 
 
 def _parse_role_arn(role_arn: str) -> tuple[str, str] | None:
-    match = re.match(r"^arn:aws:iam::(\d{12}):role/(.+)$", role_arn)
+    match = re.match(r"^arn:aws(?:-cn|-us-gov)?:iam::(\d{12}):role/(.+)$", role_arn)
     if not match:
         return None
     return match.group(1), match.group(2)
@@ -700,23 +840,27 @@ def _parse_role_arn(role_arn: str) -> tuple[str, str] | None:
 def _role_selection_error(
     candidates: list[dict[str, object]],
 ) -> ToolResult:
-    return result_from_payload({
+    return result_from_payload(
+        {
         "error": {
             "type": "RoleSelectionRequired",
-            "message": "Multiple roles available. Specify options.accountId and options.roleName.",
+            "message": (
+                "Multiple roles available. "
+                "Specify options.accountId and options.roleName."
+            ),
             "candidates": candidates,
             "hint": (
                 "Choose one of the listed roles and re-run the command with "
-                "options={'accountId': '...', 'roleName': '...'}."
-            ),
-            "retryable": True,
-        },
-    })
+                    "options={'accountId': '...', 'roleName': '...'}."
+                ),
+                "retryable": True,
+            },
+        }
+    )
 
 
 def _identity_center_error(
     message: str,
-    access_token: str | None,
 ) -> ToolResult:
     return _error_response(
         "IdentityCenterError",
@@ -727,7 +871,7 @@ def _identity_center_error(
 
 
 async def _resolve_identity_center_role_selection(
-    ctx,
+    ctx: AppContext,
     options: dict[str, object],
 ) -> tuple[str, str] | ToolResult:
     request_ctx = get_request_context_optional()
@@ -737,13 +881,23 @@ async def _resolve_identity_center_role_selection(
             "Missing Identity Center access token.",
             hint="Provide an SSO access token via Authorization: Bearer <token>.",
         )
+    access_token = request_ctx.access_token
 
-    account_id = options.get("accountId")
-    role_name = options.get("roleName")
-    role_arn = options.get("roleArn")
+    account_id: str | None = None
+    role_name: str | None = None
+    role_arn: str | None = None
+    raw_account_id = options.get("accountId")
+    raw_role_name = options.get("roleName")
+    raw_role_arn = options.get("roleArn")
+    if isinstance(raw_account_id, str) and raw_account_id.strip():
+        account_id = raw_account_id
+    if isinstance(raw_role_name, str) and raw_role_name.strip():
+        role_name = raw_role_name
+    if isinstance(raw_role_arn, str) and raw_role_arn.strip():
+        role_arn = raw_role_arn
 
     if role_arn and not (account_id or role_name):
-        parsed = _parse_role_arn(str(role_arn))
+        parsed = _parse_role_arn(role_arn)
         if parsed:
             account_id, role_name = parsed
 
@@ -758,32 +912,31 @@ async def _resolve_identity_center_role_selection(
 
     if account_id and role_name:
         try:
-            roles = await provider.list_account_roles(request_ctx.access_token, str(account_id))
+            roles = await provider.list_account_roles(access_token, account_id)
         except IdentityCenterError as exc:
-            return _identity_center_error(
-                str(exc),
-                request_ctx.access_token,
-            )
-        if not any(role.role_name == str(role_name) for role in roles):
+            return _identity_center_error(str(exc))
+        if not any(role.role_name == role_name for role in roles):
             return _error_response(
                 "RoleNotAssigned",
                 "The specified role is not assigned to this user.",
                 hint="Select a role from the available candidates.",
             )
-        return str(account_id), str(role_name)
+        return account_id, role_name
 
     try:
-        accounts = await provider.list_accounts(request_ctx.access_token)
+        accounts = await provider.list_accounts(access_token)
     except IdentityCenterError as exc:
-        return _identity_center_error(
-            str(exc),
-            request_ctx.access_token,
-        )
+        return _identity_center_error(str(exc))
 
-    # Fetch roles for all accounts in parallel to avoid N+1 API calls
-    async def fetch_roles_for_account(account):
-        roles = await provider.list_account_roles(request_ctx.access_token, account.account_id)
-        return account, roles
+    # Fetch roles for all accounts in parallel with concurrency limit
+    _semaphore = asyncio.Semaphore(10)
+
+    async def fetch_roles_for_account(
+        account: AccountEntry,
+    ) -> tuple[AccountEntry, list[RoleEntry]]:
+        async with _semaphore:
+            roles = await provider.list_account_roles(access_token, account.account_id)
+            return account, roles
 
     try:
         results = await asyncio.gather(
@@ -791,30 +944,36 @@ async def _resolve_identity_center_role_selection(
             return_exceptions=True,
         )
     except Exception as exc:
-        return _identity_center_error(
-            str(exc),
-            request_ctx.access_token,
-        )
+        return _identity_center_error(str(exc))
 
     candidates: list[dict[str, object]] = []
     for result in results:
-        if isinstance(result, IdentityCenterError):
-            return _identity_center_error(
-                str(result),
-                request_ctx.access_token,
-            )
         if isinstance(result, Exception):
             return _identity_center_error(
                 f"Unexpected error fetching roles: {result}",
-                request_ctx.access_token,
+            )
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[1], list)
+        ):
+            return _identity_center_error(
+                "Unexpected role selection result type",
             )
         account, roles = result
+        account_name = getattr(account, "account_name", None)
         for role in roles:
-            candidates.append({
-                "accountId": role.account_id,
-                "accountName": account.account_name,
-                "roleName": role.role_name,
-            })
+            account_id = getattr(role, "account_id", None)
+            role_name = getattr(role, "role_name", None)
+            if not isinstance(account_id, str) or not isinstance(role_name, str):
+                continue
+            candidates.append(
+                {
+                    "accountId": account_id,
+                    "accountName": account_name if isinstance(account_name, str) else None,
+                    "roleName": role_name,
+                }
+            )
 
     if not candidates:
         return _error_response(
@@ -831,7 +990,7 @@ async def _resolve_identity_center_role_selection(
 
 
 async def _ensure_identity_center_credentials(
-    ctx,
+    ctx: AppContext,
     account_id: str,
     role_name: str,
 ) -> ToolResult | None:
@@ -852,10 +1011,7 @@ async def _ensure_identity_center_credentials(
             request_ctx.user_id,
         )
     except IdentityCenterError as exc:
-        return _identity_center_error(
-            str(exc),
-            request_ctx.access_token,
-        )
+        return _identity_center_error(str(exc))
 
     role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
     aws_creds = AWSCredentials(
@@ -868,39 +1024,45 @@ async def _ensure_identity_center_credentials(
     return None
 
 
-def _parse_json_arg(arg: object, name: str) -> dict | ToolResult:
+def _parse_json_arg(arg: object, name: str) -> dict[str, object] | ToolResult:
     """Parse JSON arg that might be string or dict."""
     if isinstance(arg, dict):
-        return arg
+        return dict(arg)
     if isinstance(arg, str):
         try:
-            return json.loads(arg)
-        except json.JSONDecodeError as e:
-            if name == "payload":
+            parsed = json.loads(arg)
+            if not isinstance(parsed, dict):
                 return _error_response(
-                    "InvalidPayload",
-                    f"Failed to parse payload as JSON: {e}",
-                    hint="Provide payload as an object, not a string.",
+                    f"Invalid{name.capitalize()}",
+                    f"Expected JSON object for '{name}', got {type(parsed).__name__}",
+                    hint=f"Provide {name} as a JSON object.",
                 )
-            # Fail gracefully for options
-            return {}
+            return dict(parsed)
+        except json.JSONDecodeError as e:
+            return _error_response(
+                f"Invalid{name.capitalize()}",
+                f"Failed to parse {name} as JSON: {e}",
+                hint=f"Provide {name} as an object, not a string.",
+            )
+    if arg is None:
+        return {}
     return {}
 
 
 async def _record_audit_log(
-    ctx,
-    tx_id,
-    op_id,
-    service,
-    operation,
-    op_payload,
-    status,
-    region,
-    is_new_tx,
+    ctx: AppContext,
+    tx_id: str,
+    op_id: str,
+    service: str,
+    operation: str,
+    op_payload: dict[str, object],
+    status: str,
+    region: str | None,
+    is_new_tx: bool,
     model: SmithyModel,
     operation_shape_id: str,
     request_context: dict[str, object] | None = None,
-):
+) -> None:
     """Helper to record audit logs (Tx, Op, Artifact)."""
     started_at = utc_now_iso()
     request_ctx = get_request_context_optional()
@@ -914,22 +1076,24 @@ async def _record_audit_log(
             role = str(request_context.get("roleName") or role)
 
     if is_new_tx:
-        await _run_blocking(ctx, ctx.store.create_tx, AuditTxRecord(
-            tx_id=tx_id,
-            plan_id=None,
-            status=status,
-            actor=actor,
-            role=role,
-            account=account,
-            region=str(region) if region else None,
-            started_at=started_at,
-            completed_at=None,
-        ))
+        await _run_blocking(
+            ctx,
+            ctx.store.create_tx,
+            AuditTxRecord(
+                tx_id=tx_id,
+                plan_id=None,
+                status=status,
+                actor=actor,
+                role=role,
+                account=account,
+                region=str(region) if region else None,
+                started_at=started_at,
+                completed_at=None,
+            ),
+        )
 
     request_hash = _compute_request_hash(op_payload, request_context)
-    request_payload, _ = inject_idempotency_tokens(
-        model, operation_shape_id, op_payload
-    )
+    request_payload, _ = inject_idempotency_tokens(model, operation_shape_id, op_payload)
 
     op_record = AuditOpRecord(
         op_id=op_id,
@@ -945,15 +1109,23 @@ async def _record_audit_log(
     )
     await _run_blocking(ctx, ctx.store.create_op, op_record)
 
+    redacted_request_payload = _redact(request_payload)
+    request_payload_for_artifact = (
+        redacted_request_payload if isinstance(redacted_request_payload, dict) else {}
+    )
     request_artifact = await _run_blocking(
         ctx,
         ctx.artifacts.write_json,
-        "request", _redact(request_payload), prefix=tx_id
+        "request",
+        request_payload_for_artifact,
+        prefix=tx_id,
     )
     request_artifact.tx_id = tx_id
     request_artifact.op_id = op_id
     await _run_blocking(ctx, ctx.store.add_audit_artifact, request_artifact)
 
+
+_MAX_COERCE_DEPTH = 30
 
 
 def _coerce_payload_types(
@@ -963,6 +1135,7 @@ def _coerce_payload_types(
     path: str = "",
     service: str = "",
     operation: str = "",
+    depth: int = 0,
 ) -> dict[str, object]:
     """Recursively coerce payload types to match Smithy model expectations.
 
@@ -976,6 +1149,8 @@ def _coerce_payload_types(
     - nested structures, lists, and maps
     """
 
+    if depth >= _MAX_COERCE_DEPTH:
+        return payload
 
     if shape_id is None:
         return payload
@@ -986,7 +1161,9 @@ def _coerce_payload_types(
 
     # If this is an operation, get its input shape
     if isinstance(shape, OperationShape):
-        return _coerce_payload_types(model, shape.input, payload, path, service, operation)
+        return _coerce_payload_types(
+            model, shape.input, payload, path, service, operation, depth
+        )
 
     # Validate union types - exactly one member must be set
     if isinstance(shape, UnionShape):
@@ -1040,19 +1217,19 @@ def _coerce_payload_types(
         # Handle nested structures and unions
         elif isinstance(target_shape, (StructureShape, UnionShape)) and isinstance(value, dict):
             result[field_name] = _coerce_payload_types(
-                model, member.target, value, field_path, service, operation
+                model, member.target, value, field_path, service, operation, depth + 1
             )
 
         # Handle lists
         elif isinstance(target_shape, ListShape) and isinstance(value, list):
             result[field_name] = _coerce_list(
-                model, target_shape, value, field_path, service, operation
+                model, target_shape, value, field_path, service, operation, depth + 1
             )
 
         # Handle maps
         elif isinstance(target_shape, MapShape) and isinstance(value, dict):
             result[field_name] = _coerce_map(
-                model, target_shape, value, field_path, service, operation
+                model, target_shape, value, field_path, service, operation, depth + 1
             )
 
     return result
@@ -1089,8 +1266,7 @@ def _coerce_blob(
             raise ValueError(f"Invalid base64 encoding for blob field '{path}': {e}")
 
     raise ValueError(
-        f"Expected base64 string or bytes for blob field '{path}', "
-        f"got {type(value).__name__}"
+        f"Expected base64 string or bytes for blob field '{path}', got {type(value).__name__}"
     )
 
 
@@ -1207,7 +1383,7 @@ def _coerce_timestamp(value: object, path: str) -> str:
             continue
 
     # Try parsing with timezone offset pattern (e.g., +09:00, -05:00)
-    tz_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2})?$'
+    tz_pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2})?$"
     if re.match(tz_pattern, value):
         return value
 
@@ -1220,18 +1396,22 @@ def _coerce_timestamp(value: object, path: str) -> str:
 def _coerce_list(
     model: SmithyModel,
     list_shape: ListShape,
-    value: list,
+    value: list[object],
     path: str,
     service: str = "",
     operation: str = "",
-) -> list:
+    depth: int = 0,
+) -> list[object]:
     """Coerce list items to expected types."""
+
+    if depth >= _MAX_COERCE_DEPTH:
+        return value
 
     item_shape = model.get_shape(list_shape.member.target)
     if item_shape is None:
         return value
 
-    result = []
+    result: list[object] = []
     for i, item in enumerate(value):
         item_path = f"{path}[{i}]"
 
@@ -1246,9 +1426,11 @@ def _coerce_list(
         elif item_shape.type == "timestamp":
             result.append(_coerce_timestamp(item, item_path))
         elif isinstance(item_shape, (StructureShape, UnionShape)) and isinstance(item, dict):
-            result.append(_coerce_payload_types(
-                model, list_shape.member.target, item, item_path, service, operation
-            ))
+            result.append(
+                _coerce_payload_types(
+                    model, list_shape.member.target, item, item_path, service, operation, depth + 1
+                )
+            )
         else:
             result.append(item)
 
@@ -1258,18 +1440,22 @@ def _coerce_list(
 def _coerce_map(
     model: SmithyModel,
     map_shape: MapShape,
-    value: dict,
+    value: dict[str, object],
     path: str,
     service: str = "",
     operation: str = "",
-) -> dict:
+    depth: int = 0,
+) -> dict[str, object]:
     """Coerce map values to expected types."""
+
+    if depth >= _MAX_COERCE_DEPTH:
+        return value
 
     value_shape = model.get_shape(map_shape.value.target)
     if value_shape is None:
         return value
 
-    result = {}
+    result: dict[str, object] = {}
     for k, v in value.items():
         item_path = f"{path}.{k}"
 
@@ -1285,7 +1471,7 @@ def _coerce_map(
             result[k] = _coerce_timestamp(v, item_path)
         elif isinstance(value_shape, (StructureShape, UnionShape)) and isinstance(v, dict):
             result[k] = _coerce_payload_types(
-                model, map_shape.value.target, v, item_path, service, operation
+                model, map_shape.value.target, v, item_path, service, operation, depth + 1
             )
         else:
             result[k] = v
@@ -1323,9 +1509,9 @@ def _snake_case(name: str) -> str:
         GetAPIKey -> get_api_key
     """
     # Insert underscore before uppercase letters that follow lowercase letters
-    s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
+    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
     # Insert underscore before uppercase letters that are followed by lowercase letters
-    return re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
 
 
 _RETRYABLE_CODES = {
@@ -1353,17 +1539,308 @@ def _truncate_json(payload: dict[str, object], limit: int) -> str:
     return serialized[: limit - 3] + "..."
 
 
-def _limit_result_payload(payload: dict[str, object], max_chars: int) -> dict[str, object]:
-    """Limit result payload size by truncating serialized JSON output."""
-    safe_limit = max(128, max_chars)
+def _truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+_DEFAULT_COMPACT_DROP_FIELDS = frozenset(
+    {
+        "ResponseMetadata",
+        "Metadata",
+    }
+)
+
+_SECONDARY_COMPACT_DROP_FIELDS = frozenset(
+    {
+        "Environment",
+        "Tags",
+        "Policy",
+        "Policies",
+        "PolicyDocument",
+        "AssumeRolePolicyDocument",
+        "Definition",
+        "TemplateBody",
+        "Metadata",
+        "LoggingConfig",
+        "TracingConfig",
+        "VpcConfig",
+        "UserData",
+        "Configuration",
+        "Document",
+    }
+)
+
+_OPERATION_COMPACT_DROP_FIELDS: dict[tuple[str, str], frozenset[str]] = {
+    (
+        "lambda",
+        "listfunctions",
+    ): frozenset(
+        {
+            "Code",
+            "CodeSha256",
+            "Environment",
+            "EnvironmentResponse",
+            "FileSystemConfigs",
+            "ImageConfigResponse",
+            "LastUpdateStatusReason",
+            "LastUpdateStatusReasonCode",
+            "Layers",
+            "LoggingConfig",
+            "RuntimeVersionConfig",
+            "SigningJobArn",
+            "SigningProfileVersionArn",
+            "StateReason",
+            "StateReasonCode",
+            "Tags",
+            "TracingConfig",
+            "Variables",
+            "VpcConfig",
+        }
+    ),
+}
+
+_COMPACT_PRESETS_AUTO: tuple[dict[str, int], ...] = (
+    {"max_depth": 4, "max_list_items": 40, "max_string_chars": 400},
+    {"max_depth": 3, "max_list_items": 25, "max_string_chars": 250},
+    {"max_depth": 2, "max_list_items": 15, "max_string_chars": 160},
+    {"max_depth": 1, "max_list_items": 8, "max_string_chars": 96},
+)
+
+_COMPACT_PRESETS_COMPACT: tuple[dict[str, int], ...] = (
+    {"max_depth": 3, "max_list_items": 20, "max_string_chars": 200},
+    {"max_depth": 2, "max_list_items": 10, "max_string_chars": 120},
+    {"max_depth": 1, "max_list_items": 6, "max_string_chars": 80},
+)
+
+
+def _json_size(value: object) -> int:
+    return len(json.dumps(value, default=json_default, ensure_ascii=True))
+
+
+def _parse_response_mode(options: dict[str, object] | None) -> str:
+    if not options:
+        return "auto"
+    raw = options.get("responseMode")
+    if not isinstance(raw, str):
+        return "auto"
+    mode = raw.strip().lower()
+    if mode in {"auto", "compact", "full"}:
+        return mode
+    return "auto"
+
+
+def _parse_max_result_items(options: dict[str, object] | None) -> int | None:
+    if not options:
+        return None
+    raw = options.get("maxResultItems")
+    if isinstance(raw, bool):
+        return None
+    if not isinstance(raw, (int, str)):
+        return None
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(parsed, 200))
+
+
+def _parse_omit_response_fields(options: dict[str, object] | None) -> set[str]:
+    if not options:
+        return set()
+    raw = options.get("omitResponseFields")
+    if not isinstance(raw, list):
+        return set()
+    fields: set[str] = set()
+    for item in raw[:64]:
+        if not isinstance(item, str):
+            continue
+        normalized = item.strip()
+        if not normalized or len(normalized) > 64:
+            continue
+        fields.add(normalized)
+    return fields
+
+
+def _operation_drop_fields(
+    service: str | None,
+    operation: str | None,
+    extra_fields: set[str],
+) -> set[str]:
+    fields = set(_DEFAULT_COMPACT_DROP_FIELDS)
+    key = ((service or "").strip().lower(), (operation or "").strip().lower())
+    fields.update(_OPERATION_COMPACT_DROP_FIELDS.get(key, frozenset()))
+    fields.update(extra_fields)
+    return fields
+
+
+def _drop_field_levels(
+    service: str | None,
+    operation: str | None,
+    extra_fields: set[str],
+) -> tuple[set[str], ...]:
+    base = _operation_drop_fields(service, operation, extra_fields)
+    broadened = set(base)
+    broadened.update(_SECONDARY_COMPACT_DROP_FIELDS)
+    return base, broadened
+
+
+def _compact_summary_value(value: object, max_string_chars: int) -> object:
+    if isinstance(value, str):
+        return _truncate_text(value, max_string_chars)
+    if isinstance(value, list):
+        return {
+            "_mcp_compacted_type": "list",
+            "itemCount": len(value),
+        }
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        return {
+            "_mcp_compacted_type": "object",
+            "keyCount": len(keys),
+            "keys": keys[:12],
+        }
+    return value
+
+
+def _compact_payload(
+    value: object,
+    *,
+    max_depth: int,
+    max_list_items: int,
+    max_string_chars: int,
+    drop_fields: set[str],
+    depth: int = 0,
+) -> object:
+    if isinstance(value, dict):
+        compacted: dict[str, object] = {}
+        omitted_fields: list[str] = []
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            if key in drop_fields:
+                omitted_fields.append(key)
+                continue
+            if depth >= max_depth:
+                compacted[key] = _compact_summary_value(raw_value, max_string_chars)
+                continue
+            compacted[key] = _compact_payload(
+                raw_value,
+                max_depth=max_depth,
+                max_list_items=max_list_items,
+                max_string_chars=max_string_chars,
+                drop_fields=drop_fields,
+                depth=depth + 1,
+            )
+        if omitted_fields:
+            compacted["_mcp_omitted_fields"] = sorted(set(omitted_fields))
+        return compacted
+
+    if isinstance(value, list):
+        if depth >= max_depth:
+            return {
+                "_mcp_compacted_type": "list",
+                "itemCount": len(value),
+            }
+        sliced = value[:max_list_items]
+        compacted_list = [
+            _compact_payload(
+                item,
+                max_depth=max_depth,
+                max_list_items=max_list_items,
+                max_string_chars=max_string_chars,
+                drop_fields=drop_fields,
+                depth=depth + 1,
+            )
+            for item in sliced
+        ]
+        if len(value) > max_list_items:
+            compacted_list.append({"_mcp_truncated_items": len(value) - max_list_items})
+        return compacted_list
+
+    if isinstance(value, str):
+        return _truncate_text(value, max_string_chars)
+
+    return value
+
+
+def _preview_payload(
+    payload: dict[str, object],
+    safe_limit: int,
+    original_chars: int,
+    hint: str,
+) -> dict[str, object]:
     serialized = json.dumps(payload, default=json_default, ensure_ascii=True)
-    if len(serialized) <= safe_limit:
-        return payload
     return {
         "truncated": True,
         "maxCharacters": safe_limit,
-        "preview": serialized[: safe_limit - 3] + "...",
+        "originalCharacters": original_chars,
+        "strategy": "preview",
+        "preview": _truncate_text(serialized, safe_limit),
+        "hint": hint,
     }
+
+
+def _limit_result_payload(
+    payload: dict[str, object],
+    max_chars: int,
+    *,
+    service: str | None = None,
+    operation: str | None = None,
+    options: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Limit result payload size while preserving useful structure."""
+    safe_limit = max(128, max_chars)
+    original_chars = _json_size(payload)
+    if original_chars <= safe_limit:
+        return payload
+
+    response_mode = _parse_response_mode(options)
+    if response_mode == "full":
+        return _preview_payload(
+            payload,
+            safe_limit,
+            original_chars,
+            "Use options.responseMode='compact' or reduce request scope (pagination/filter).",
+        )
+
+    extra_omit_fields = _parse_omit_response_fields(options)
+    max_result_items = _parse_max_result_items(options)
+    drop_field_levels = _drop_field_levels(service, operation, extra_omit_fields)
+    presets = _COMPACT_PRESETS_COMPACT if response_mode == "compact" else _COMPACT_PRESETS_AUTO
+
+    for drop_fields in drop_field_levels:
+        for preset in presets:
+            list_cap = preset["max_list_items"]
+            if max_result_items is not None:
+                list_cap = min(list_cap, max_result_items)
+            compact_result = _compact_payload(
+                payload,
+                max_depth=preset["max_depth"],
+                max_list_items=max(1, list_cap),
+                max_string_chars=preset["max_string_chars"],
+                drop_fields=drop_fields,
+            )
+            candidate = {
+                "truncated": True,
+                "maxCharacters": safe_limit,
+                "originalCharacters": original_chars,
+                "strategy": "compact",
+                "responseMode": response_mode,
+                "result": compact_result,
+            }
+            if _json_size(candidate) <= safe_limit:
+                return candidate
+
+    return _preview_payload(
+        payload,
+        safe_limit,
+        original_chars,
+        (
+            "Compact output still exceeded MAX_OUTPUT_CHARACTERS; "
+            "set lower maxResultItems or request a narrower operation scope."
+        ),
+    )
 
 
 SENSITIVE_KEYS = [
@@ -1375,21 +1852,27 @@ SENSITIVE_KEYS = [
     "sessiontoken",
     "clientsecret",
     "apikey",
+    "credential",
+    "authorization",
 ]
 
+_MAX_REDACT_DEPTH = 20
 
-def _redact(value: object) -> object:
+
+def _redact(value: object, depth: int = 0) -> object:
     """Redact sensitive values from a payload."""
+    if depth >= _MAX_REDACT_DEPTH:
+        return "***"
     if isinstance(value, dict):
         redacted: dict[str, object] = {}
         for key, val in value.items():
             if any(marker in key.lower() for marker in SENSITIVE_KEYS):
                 redacted[key] = "***"
             else:
-                redacted[key] = _redact(val)
+                redacted[key] = _redact(val, depth + 1)
         return redacted
     if isinstance(value, list):
-        return [_redact(item) for item in value]
+        return [_redact(item, depth + 1) for item in value]
     return value
 
 
@@ -1429,8 +1912,13 @@ execute_tool = ToolSpec(
         "Required top-level arguments: 'action' (enum: validate/invoke), "
         "'service' (string), 'operation' (string), 'payload' (object: API params). "
         "Optional: 'region' (string), 'options' (object: confirmationToken, "
-        "accountId/roleName for Identity Center). "
+        "accountId/roleName for Identity Center, responseMode/maxResultItems/"
+        "omitResponseFields for large responses). "
         "\n\n"
+        "LARGE RESPONSE RECOMMENDATION:\n"
+        "- Default/recommended: options={'responseMode':'auto'}\n"
+        "- For list APIs first try: options={'responseMode':'compact','maxResultItems':20}\n"
+        "- For full fidelity: options={'responseMode':'full'} with narrower request scope\n\n"
         "BINARY DATA: For binary fields (Body, ZipFile, etc.), provide "
         "base64-encoded content as a string."
         "\n\n"

@@ -25,7 +25,7 @@ class SmithyCatalog:
     def _build_index(self) -> None:
         # Track which operations are explicitly attached to services
         attached_ops: set[str] = set()
-        
+
         # Track namespace -> service_name mapping for orphan rescue
         # e.g. "com.amazonaws.lambda" -> "lambda"
         namespace_map: dict[str, str] = {}
@@ -33,7 +33,7 @@ class SmithyCatalog:
         for shape in self._model.shapes.values():
             if isinstance(shape, ServiceShape):
                 service_name = _service_name(shape)
-                
+
                 # Map namespace to service name
                 # Shape ID: com.amazonaws.lambda#AWSGirApiService -> namespace: com.amazonaws.lambda
                 if "#" in shape.shape_id:
@@ -44,10 +44,10 @@ class SmithyCatalog:
                     op_shape = self._model.get_shape(op_id)
                     if not isinstance(op_shape, OperationShape):
                         continue
-                    
+
                     attached_ops.add(op_id)
                     self._index_operation(service_name, op_id, op_shape)
-        
+
         # Orphan Rescue: Find operations not attached to any service
         # but sharing a namespace with a known service.
         for op_id, shape in self._model.shapes.items():
@@ -77,11 +77,11 @@ class SmithyCatalog:
         key = OperationRef(service=service, operation=operation).key
         if key in self._operations:
             return self._operations[key]
-        
+
         # Try case-insensitive / snake-case match
         target_svc = service.lower()
         target_op = operation.lower().replace("-", "").replace("_", "")
-        
+
         for entry in self._operations.values():
             if entry.ref.service.lower() == target_svc:
                 op_norm = entry.ref.operation.lower().replace("-", "").replace("_", "")
@@ -89,36 +89,32 @@ class SmithyCatalog:
                     return entry
         return None
 
-    def search(self, query: str, service: str | None = None) -> list[OperationEntry]:
+    def search(self, query: str, service: str | None = None) -> Iterable[OperationEntry]:
+        """Yield matching operations lazily.
+
+        Returns an ``Iterable`` (generator) so that callers can apply
+        their own limit / policy filter without materialising the full
+        result set in memory first.
+        """
         terms = query.lower().split()
         if not terms:
-            return []
+            return
 
-        results = []
         for entry in self._operations.values():
             # If explicit service hint is provided, filter strictly
             if service and entry.ref.service != service:
                 continue
 
-            # Check if all terms match
-            matches_all = True
-            
             # Prepare searchable text
             svc = entry.ref.service.lower()
             op = entry.ref.operation.lower()
             doc = (entry.documentation or "").lower()
-            
-            for term in terms:
-                # Term matches if it appears in service, operation, or doc
-                term_hit = (term in svc) or (term in op) or (term in doc)
-                if not term_hit:
-                    matches_all = False
-                    break
-            
-            if matches_all:
-                results.append(entry)
 
-        return results
+            if all(
+                (term in svc) or (term in op) or (term in doc)
+                for term in terms
+            ):
+                yield entry
 
 
 def _operation_name(shape_id: str) -> str:

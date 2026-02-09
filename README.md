@@ -97,7 +97,7 @@ structure GetForecastOutput {
 
 このプロジェクトの主対象（Claude Code / Claude Desktop）では、こちらを推奨します。
 
-- `/.well-known/oauth-protected-resource` を公開
+- `/.well-known/oauth-protected-resource/mcp` を canonical endpoint として公開（互換で `/.well-known/oauth-protected-resource` も公開）
 - 必要に応じて OAuth proxy モードを有効化し、以下を公開
   - `GET /authorize`
   - `POST /token`
@@ -385,8 +385,9 @@ TRANSPORT_MODE=http python server.py
 | `AUTH_PROVIDER` | HTTP/RemoteでYes | 認証方式 | `multi-idp` | AWS SSOのみなら `identity-center`, Entraなど外部IdPなら `multi-idp` |
 | `AUTH_IDP_CONFIG_PATH` | multi-idpでYes | IdP定義ファイル | `./idp_config.yaml` | リポジトリ内のファイルを指定 |
 | `AUTH_IDENTITY_CENTER_REGION` | identity-centerでYes | IAM Identity Center リージョン | `ap-northeast-1` | AWSコンソール > IAM Identity Center > 設定 |
-| `MCP_HOST` | No | bind host | `0.0.0.0` | コンテナなら `0.0.0.0`, ローカルのみなら `127.0.0.1` |
+| `MCP_HOST` | No | bind host | `127.0.0.1` | コンテナ/公開用途では明示的に `0.0.0.0` を指定 |
 | `MCP_PORT` | No | bind port | `8000` | 任意の空きポート |
+| `MCP_PUBLIC_BASE_URL` | remote+multi-idpでYes | 外部公開URLの固定化 | `https://mcp.example.com` | OAuth metadata/`WWW-Authenticate` の公開URL生成に使用（Hostヘッダ反射を防止） |
 | `AWS_STS_REGION` | HTTP/Remoteで推奨 | STS呼び出しリージョン | `us-east-1` | 基本的に `us-east-1` (グローバルエンドポイント) または利用リージョン |
 | `POLICY_PATH` | 推奨 | ローカルポリシー | `./policy.yaml` | 許可する操作を定義したファイルパス |
 | `SQLITE_PATH` | 推奨 | 監査DB | `./data/aws_mcp.sqlite` | 監査ログの保存先 |
@@ -533,6 +534,16 @@ role_mappings:
 - 目的: 検証または実行
 - 入力: `action=validate|invoke`, `service`, `operation`, `payload`, `options`
 - 破壊的操作は確認トークン方式
+- 大きなレスポンス向けオプション:
+  - `options.responseMode`: `auto`(既定) / `compact` / `full`
+  - `options.maxResultItems`: 配列の最大返却件数（compact時）
+  - `options.omitResponseFields`: 除外したいフィールド名配列
+- 推奨値:
+  - まず `options={"responseMode":"auto"}`（既定）
+  - 一覧系APIは `options={"responseMode":"compact","maxResultItems":20}` から開始
+  - フル情報が必要な場合のみ `options={"responseMode":"full"}` + API側の絞り込み/ページング
+- `MAX_OUTPUT_CHARACTERS` を超える場合、`auto/compact` では構造化compact結果を返し、
+  `full` では preview 形式で切り詰める
 
 ---
 
@@ -592,7 +603,11 @@ role_mappings:
 ### テスト
 
 ```bash
-PYTHONPATH=src pytest tests/
+# 基本実行
+pytest tests/
+
+# カバレッジ付き
+pytest tests/ --cov=aws_cli_mcp --cov-report=term-missing -v
 ```
 
 ### Lint

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -17,7 +18,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from aws_cli_mcp.auth.idp_config import IdPConfig, MultiIdPConfig, OAuthProxyConfig
-from aws_cli_mcp.utils.http import first_forwarded_value
+from aws_cli_mcp.utils.http import (
+    normalize_public_base_url,
+    resolve_request_origin,
+    validate_oidc_url,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -35,6 +40,26 @@ _MAX_REGISTERED_CLIENTS: int = 10_000
 
 _PKCE_ALLOWED_PATTERN = re.compile(r"^[A-Za-z0-9\-._~]+$")
 _BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Standard OAuth 2.0 token response fields (RFC 6749 §5.1 + OIDC).
+# Upstream IdP responses may contain extra internal fields (session IDs, PII)
+# that should not be forwarded to the client.
+_ALLOWED_TOKEN_FIELDS = frozenset(
+    {
+        "access_token",
+        "token_type",
+        "expires_in",
+        "refresh_token",
+        "scope",
+        "id_token",
+    }
+)
+
+
+def _filter_token_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return only standard OAuth fields from an upstream token response."""
+    return {k: v for k, v in payload.items() if k in _ALLOWED_TOKEN_FIELDS}
 
 
 @dataclass
@@ -76,19 +101,29 @@ class OAuthProxyBroker:
         self,
         config: MultiIdPConfig,
         trust_forwarded_headers: bool = False,
+        public_base_url: str | None = None,
     ) -> None:
         self.config = config
         self.proxy: OAuthProxyConfig = config.oauth_proxy
         self._trust_forwarded_headers = trust_forwarded_headers
+        self._public_base_url = (
+            normalize_public_base_url(public_base_url) if public_base_url else None
+        )
         self._transactions: dict[str, OAuthTransaction] = {}
         self._codes: dict[str, AuthorizationCodeRecord] = {}
         self._clients: dict[str, RegisteredClient] = {}
         self._oidc_metadata: dict[str, Any] | None = None
         self._oidc_metadata_fetched_at: float = 0.0
+        self._state_lock = asyncio.Lock()
 
     @staticmethod
-    def _first_forwarded_value(value: str | None) -> str | None:
-        return first_forwarded_value(value)
+    def _is_loopback_host(hostname: str | None) -> bool:
+        if hostname is None:
+            return False
+        normalized = hostname.strip().lower()
+        if normalized.startswith("[") and normalized.endswith("]"):
+            normalized = normalized[1:-1]
+        return normalized in _LOOPBACK_HOSTS
 
     @staticmethod
     def _validate_redirect_uri(uri: str) -> str | None:
@@ -99,7 +134,7 @@ class OAuthProxyBroker:
             return f"Invalid URI: {uri}"
         if not parsed.scheme or not parsed.netloc:
             return f"Malformed redirect_uri: {uri}"
-        is_localhost = parsed.hostname in {"localhost", "127.0.0.1", "[::1]"}
+        is_localhost = OAuthProxyBroker._is_loopback_host(parsed.hostname)
         if not is_localhost and parsed.scheme != "https":
             return f"redirect_uri must use https (got {parsed.scheme}): {uri}"
         return None
@@ -110,7 +145,7 @@ class OAuthProxyBroker:
             parsed = urlparse(uri)
         except Exception:
             return False
-        return parsed.hostname in {"localhost", "127.0.0.1", "[::1]"}
+        return OAuthProxyBroker._is_loopback_host(parsed.hostname)
 
     @staticmethod
     def _is_valid_pkce_code_challenge(value: str) -> bool:
@@ -138,20 +173,23 @@ class OAuthProxyBroker:
         raise RuntimeError(f"Unsupported upstream token auth method: {method}")
 
     def _apply_upstream_client_auth(self, payload: dict[str, str]) -> None:
-        payload["client_id"] = self.proxy.upstream_client_id
+        payload["client_id"] = self._require_upstream_client_id()
         auth_method = self._resolve_upstream_token_auth_method()
         if auth_method == "client_secret_post" and self.proxy.upstream_client_secret:
             payload["client_secret"] = self.proxy.upstream_client_secret
 
+    def _require_upstream_client_id(self) -> str:
+        client_id = self.proxy.upstream_client_id
+        if not client_id:
+            raise RuntimeError("oauth_proxy.upstream_client_id is required")
+        return client_id
+
     def _origin(self, request: Request) -> str:
-        forwarded_proto = None
-        forwarded_host = None
-        if self._trust_forwarded_headers:
-            forwarded_proto = self._first_forwarded_value(request.headers.get("x-forwarded-proto"))
-            forwarded_host = self._first_forwarded_value(request.headers.get("x-forwarded-host"))
-        scheme = forwarded_proto or request.url.scheme
-        host = forwarded_host or request.headers.get("host") or request.url.netloc
-        return f"{scheme}://{host}"
+        return resolve_request_origin(
+            request,
+            trust_forwarded_headers=self._trust_forwarded_headers,
+            public_base_url=self._public_base_url,
+        )
 
     def _callback_url(self, request: Request) -> str:
         return f"{self._origin(request)}{self.proxy.redirect_path}"
@@ -175,6 +213,12 @@ class OAuthProxyBroker:
             resp = await client.get(url, timeout=10.0)
             resp.raise_for_status()
             data = resp.json()
+
+        # SSRF protection: validate discovered endpoint URLs before caching.
+        for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            endpoint = data.get(key)
+            if isinstance(endpoint, str) and endpoint:
+                validate_oidc_url(endpoint, label=key)
 
         self._oidc_metadata = data
         self._oidc_metadata_fetched_at = now
@@ -224,7 +268,6 @@ class OAuthProxyBroker:
 
     async def authorize(self, request: Request) -> Response:
         """Client-facing /authorize endpoint."""
-        self._cleanup_expired()
         qp = request.query_params
 
         if qp.get("response_type") != "code":
@@ -249,14 +292,17 @@ class OAuthProxyBroker:
         if redirect_error:
             return self._oauth_error("invalid_request", redirect_error)
 
-        if self._clients.get(client_id):
-            if not self._is_registered_redirect_uri(client_id, redirect_uri):
-                return self._oauth_error("invalid_request", "redirect_uri is not registered")
-        elif not self._is_loopback_redirect_uri(redirect_uri):
-            return self._oauth_error(
-                "invalid_request",
-                "unregistered clients must use localhost loopback redirect_uri",
-            )
+        async with self._state_lock:
+            self._cleanup_expired()
+
+            if self._clients.get(client_id):
+                if not self._is_registered_redirect_uri(client_id, redirect_uri):
+                    return self._oauth_error("invalid_request", "redirect_uri is not registered")
+            elif not self._is_loopback_redirect_uri(redirect_uri):
+                return self._oauth_error(
+                    "invalid_request",
+                    "unregistered clients must use localhost loopback redirect_uri",
+                )
 
         code_challenge = (qp.get("code_challenge") or "").strip() or None
         code_challenge_method = (qp.get("code_challenge_method") or "S256").strip()
@@ -272,26 +318,28 @@ class OAuthProxyBroker:
             )
         if not self._is_valid_pkce_code_challenge(code_challenge):
             return self._oauth_error("invalid_request", "code_challenge format is invalid")
-        if not self._has_capacity(len(self._transactions), _MAX_TRANSACTIONS):
-            return self._oauth_error(
-                "temporarily_unavailable",
-                "too many pending authorization transactions",
-                503,
+
+        async with self._state_lock:
+            if not self._has_capacity(len(self._transactions), _MAX_TRANSACTIONS):
+                return self._oauth_error(
+                    "temporarily_unavailable",
+                    "too many pending authorization transactions",
+                    503,
+                )
+
+            upstream_code_verifier = secrets.token_urlsafe(64)
+            upstream_code_challenge = self._build_s256_challenge(upstream_code_verifier)
+
+            txn_id = secrets.token_urlsafe(24)
+            self._transactions[txn_id] = OAuthTransaction(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                original_state=state,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                upstream_code_verifier=upstream_code_verifier,
+                created_at=time.time(),
             )
-
-        upstream_code_verifier = secrets.token_urlsafe(64)
-        upstream_code_challenge = self._build_s256_challenge(upstream_code_verifier)
-
-        txn_id = secrets.token_urlsafe(24)
-        self._transactions[txn_id] = OAuthTransaction(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            original_state=state,
-            code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method,
-            upstream_code_verifier=upstream_code_verifier,
-            created_at=time.time(),
-        )
 
         upstream_metadata = await self._discover_upstream_oidc()
         authorize_endpoint = upstream_metadata.get("authorization_endpoint")
@@ -300,7 +348,7 @@ class OAuthProxyBroker:
 
         params = {
             "response_type": "code",
-            "client_id": self.proxy.upstream_client_id,
+            "client_id": self._require_upstream_client_id(),
             "redirect_uri": self._callback_url(request),
             "state": txn_id,
             "scope": " ".join(self.proxy.upstream_scopes),
@@ -313,10 +361,11 @@ class OAuthProxyBroker:
 
     async def callback(self, request: Request) -> Response:
         """Upstream IdP callback endpoint."""
-        self._cleanup_expired()
         qp = request.query_params
         txn_id = (qp.get("state") or "").strip()
-        transaction = self._transactions.get(txn_id)
+        async with self._state_lock:
+            self._cleanup_expired()
+            transaction = self._transactions.pop(txn_id, None)
         if not transaction:
             return self._oauth_error("invalid_request", "OAuth transaction not found", 400)
 
@@ -373,24 +422,24 @@ class OAuthProxyBroker:
                 502,
             )
 
-        if not self._has_capacity(len(self._codes), _MAX_AUTHORIZATION_CODES):
-            return self._oauth_error(
-                "temporarily_unavailable",
-                "too many pending authorization codes",
-                503,
-            )
+        async with self._state_lock:
+            if not self._has_capacity(len(self._codes), _MAX_AUTHORIZATION_CODES):
+                return self._oauth_error(
+                    "temporarily_unavailable",
+                    "too many pending authorization codes",
+                    503,
+                )
 
-        local_code = secrets.token_urlsafe(32)
-        self._codes[local_code] = AuthorizationCodeRecord(
-            client_id=transaction.client_id,
-            redirect_uri=transaction.redirect_uri,
-            code_challenge=transaction.code_challenge,
-            code_challenge_method=transaction.code_challenge_method,
-            token_response=token_payload,
-            created_at=time.time(),
-            consumed=False,
-        )
-        self._transactions.pop(txn_id, None)
+            local_code = secrets.token_urlsafe(32)
+            self._codes[local_code] = AuthorizationCodeRecord(
+                client_id=transaction.client_id,
+                redirect_uri=transaction.redirect_uri,
+                code_challenge=transaction.code_challenge,
+                code_challenge_method=transaction.code_challenge_method,
+                token_response=token_payload,
+                created_at=time.time(),
+                consumed=False,
+            )
 
         params = urlencode({"code": local_code, "state": transaction.original_state})
         return RedirectResponse(f"{transaction.redirect_uri}?{params}", status_code=302)
@@ -410,7 +459,8 @@ class OAuthProxyBroker:
 
     async def token(self, request: Request) -> Response:
         """Client-facing /token endpoint."""
-        self._cleanup_expired()
+        async with self._state_lock:
+            self._cleanup_expired()
         raw_body = (await request.body()).decode("utf-8", errors="replace")
         form_values = parse_qs(raw_body, keep_blank_values=True)
 
@@ -441,19 +491,26 @@ class OAuthProxyBroker:
             if code_verifier and not self._is_valid_pkce_code_verifier(code_verifier):
                 return self._oauth_error("invalid_grant", "PKCE code_verifier is invalid")
 
-            record = self._codes.get(code)
-            if not record:
-                return self._oauth_error(
-                    "invalid_grant",
-                    "authorization code is invalid or expired",
-                )
-            if record.consumed:
-                return self._oauth_error("invalid_grant", "authorization code already used")
-            if client_id != record.client_id:
-                return self._oauth_error("invalid_client", "client_id mismatch", 401)
-            if redirect_uri != record.redirect_uri:
-                return self._oauth_error("invalid_grant", "redirect_uri mismatch")
-            registration = self._clients.get(client_id)
+            async with self._state_lock:
+                record = self._codes.get(code)
+                if not record:
+                    return self._oauth_error(
+                        "invalid_grant",
+                        "authorization code is invalid or expired",
+                    )
+                if record.consumed:
+                    return self._oauth_error("invalid_grant", "authorization code already used")
+                # Validate client_id and redirect_uri BEFORE consuming the
+                # code to prevent a DoS where an attacker with a valid code
+                # but wrong client_id wastes it.
+                if client_id != record.client_id:
+                    return self._oauth_error("invalid_client", "client_id mismatch", 401)
+                if redirect_uri != record.redirect_uri:
+                    return self._oauth_error("invalid_grant", "redirect_uri mismatch")
+                # Mark consumed after validation passes.
+                record.consumed = True
+            async with self._state_lock:
+                registration = self._clients.get(client_id)
             if registration and registration.token_endpoint_auth_method == "client_secret_post":
                 provided_secret = form_get("client_secret").strip()
                 expected_secret = registration.client_secret or ""
@@ -464,15 +521,29 @@ class OAuthProxyBroker:
             if not self._verify_pkce(record, code_verifier):
                 return self._oauth_error("invalid_grant", "PKCE verification failed")
 
-            record.consumed = True
-            payload = dict(record.token_response)
+            payload = _filter_token_response(record.token_response)
             payload.setdefault("token_type", "Bearer")
             return JSONResponse(payload)
 
         if grant_type == "refresh_token":
             refresh_token = form_get("refresh_token").strip()
+            client_id = form_get("client_id").strip()
+            client_secret = form_get("client_secret").strip()
             if not refresh_token:
                 return self._oauth_error("invalid_request", "refresh_token is required")
+            if not client_id:
+                return self._oauth_error("invalid_request", "client_id is required")
+            if len(client_id) > _MAX_CLIENT_ID_LENGTH:
+                return self._oauth_error("invalid_request", "client_id is too long")
+
+            async with self._state_lock:
+                registration = self._clients.get(client_id)
+            if registration is None:
+                return self._oauth_error("invalid_client", "client is not registered", 401)
+            if registration.token_endpoint_auth_method == "client_secret_post":
+                expected_secret = registration.client_secret or ""
+                if not client_secret or not secrets.compare_digest(client_secret, expected_secret):
+                    return self._oauth_error("invalid_client", "client_secret mismatch", 401)
 
             metadata = await self._discover_upstream_oidc()
             token_endpoint = metadata.get("token_endpoint")
@@ -500,7 +571,9 @@ class OAuthProxyBroker:
                     502,
                 )
             try:
-                return JSONResponse(token_resp.json(), status_code=200)
+                return JSONResponse(
+                    _filter_token_response(token_resp.json()), status_code=200
+                )
             except Exception:
                 _logger.warning("upstream refresh exchange returned non-JSON response")
                 return self._oauth_error(
@@ -521,12 +594,6 @@ class OAuthProxyBroker:
         redirect_uris = body.get("redirect_uris") or []
         if not isinstance(redirect_uris, list) or not redirect_uris:
             return self._oauth_error("invalid_client_metadata", "redirect_uris is required")
-        if not self._has_capacity(len(self._clients), _MAX_REGISTERED_CLIENTS):
-            return self._oauth_error(
-                "temporarily_unavailable",
-                "too many registered clients",
-                503,
-            )
 
         for uri in redirect_uris:
             if len(str(uri)) > _MAX_REDIRECT_URI_LENGTH:
@@ -556,7 +623,14 @@ class OAuthProxyBroker:
             token_endpoint_auth_method=token_auth_method,
             created_at=issued_at,
         )
-        self._clients[client_id] = registration
+        async with self._state_lock:
+            if not self._has_capacity(len(self._clients), _MAX_REGISTERED_CLIENTS):
+                return self._oauth_error(
+                    "temporarily_unavailable",
+                    "too many registered clients",
+                    503,
+                )
+            self._clients[client_id] = registration
 
         response = {
             "client_id": registration.client_id,
@@ -610,6 +684,7 @@ class OAuthProxyBroker:
 def create_oauth_proxy_broker(
     config: MultiIdPConfig,
     trust_forwarded_headers: bool = False,
+    public_base_url: str | None = None,
 ) -> OAuthProxyBroker | None:
     """Factory for optional OAuth proxy broker."""
     if not config.oauth_proxy.enabled:
@@ -617,4 +692,5 @@ def create_oauth_proxy_broker(
     return OAuthProxyBroker(
         config,
         trust_forwarded_headers=trust_forwarded_headers,
+        public_base_url=public_base_url,
     )

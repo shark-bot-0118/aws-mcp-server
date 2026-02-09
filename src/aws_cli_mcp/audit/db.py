@@ -5,15 +5,16 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Iterable
-
-from aws_cli_mcp.utils.time import utc_now_iso
+from typing import Mapping, Sequence
 
 from aws_cli_mcp.audit.models import (
     ArtifactRecord,
     AuditOpRecord,
     AuditTxRecord,
 )
+
+_SqlValue = str | bytes | int | float | None
+_SqlParams = Sequence[_SqlValue] | Mapping[str, _SqlValue]
 
 
 class SqliteStore:
@@ -22,6 +23,7 @@ class SqliteStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        self._closed = False
         if wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -111,6 +113,8 @@ class SqliteStore:
             );
 
             CREATE INDEX IF NOT EXISTS idx_audit_tx_plan_id ON audit_tx(plan_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_tx_status_started_at
+                ON audit_tx(status, started_at);
             CREATE INDEX IF NOT EXISTS idx_audit_op_tx_id ON audit_op(tx_id);
             CREATE INDEX IF NOT EXISTS idx_audit_op_request_hash ON audit_op(request_hash);
             CREATE INDEX IF NOT EXISTS idx_plan_status ON plans(status);
@@ -119,17 +123,30 @@ class SqliteStore:
         )
         self._conn.commit()
 
-    def execute(self, query: str, params: Iterable[object]) -> None:
+    def execute(
+        self,
+        query: str,
+        params: _SqlParams,
+    ) -> None:
         with self._lock:
             self._conn.execute(query, params)
             self._conn.commit()
 
-    def fetch_one(self, query: str, params: Iterable[object]) -> sqlite3.Row | None:
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._conn.close()
+            self._closed = True
+
+    def fetch_one(
+        self,
+        query: str,
+        params: _SqlParams,
+    ) -> sqlite3.Row | None:
         with self._lock:
             cur = self._conn.execute(query, params)
             return cur.fetchone()
-
-
 
     def create_tx(self, tx: AuditTxRecord) -> None:
         self.execute(
@@ -165,7 +182,10 @@ class SqliteStore:
 
     def get_pending_op(self, tx_id: str) -> AuditOpRecord | None:
         row = self.fetch_one(
-            "SELECT * FROM audit_op WHERE tx_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1",
+            (
+                "SELECT * FROM audit_op WHERE tx_id = ? AND status = ? "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
             (tx_id, "PendingConfirmation"),
         )
         if row is None:
@@ -177,6 +197,22 @@ class SqliteStore:
             "UPDATE audit_tx SET status = ?, completed_at = ? WHERE tx_id = ?",
             (status, completed_at, tx_id),
         )
+
+    def claim_pending_tx(self, tx_id: str) -> bool:
+        """Atomically transition a PendingConfirmation tx to Started.
+
+        Returns True if exactly one row was updated (i.e. the caller won the
+        race), False otherwise.  This prevents TOCTOU double-execution when
+        two concurrent requests present the same confirmation token.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE audit_tx SET status = 'Started' "
+                "WHERE tx_id = ? AND status = 'PendingConfirmation'",
+                (tx_id,),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def create_op(self, op: AuditOpRecord) -> None:
         self.execute(
@@ -235,18 +271,12 @@ class SqliteStore:
             ),
         )
 
-
-
     def cleanup_pending_txs(self, ttl_seconds: int) -> int:
         """Delete pending transactions older than ttl_seconds.
 
         Returns:
             Number of transactions deleted.
         """
-        import time
-
-        # Calculate cutoff time
-        cutoff_ms = (time.time() - ttl_seconds) * 1000
         # Convert to ISO format effectively?
         # Actually, stored dates are ISO strings. Comparing ISO strings works chronologically
         # mainly if they are UTC. our utc_now_iso returns UTC ISO.
@@ -259,19 +289,22 @@ class SqliteStore:
         with self._lock:
             # Find expired tx_ids
             rows = self._conn.execute(
-                "SELECT tx_id FROM audit_tx WHERE status = 'PendingConfirmation' AND started_at < ?",
+                (
+                    "SELECT tx_id FROM audit_tx "
+                    "WHERE status = 'PendingConfirmation' AND started_at < ?"
+                ),
                 (cutoff_iso,),
             ).fetchall()
 
             if not rows:
                 return 0
 
-            expired_tx_ids = [row["tx_id"] for row in rows]
-            
+            expired_tx_ids: list[str] = [row["tx_id"] for row in rows]
+
             # We need to delete associated operations and artifacts first if CASCADE is not on.
             # Since we use executemany or "IN" clause.
             placeholders = ",".join("?" for _ in expired_tx_ids)
-            
+
             # 1. Delete associated artifacts (linked via tx_id)
             self._conn.execute(
                 f"DELETE FROM audit_artifacts WHERE tx_id IN ({placeholders})",

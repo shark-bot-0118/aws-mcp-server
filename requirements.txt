@@ -14,3 +14,4 @@ pytest
 pytest-cov
 ruff
 mypy
+pip-audit>=2.7

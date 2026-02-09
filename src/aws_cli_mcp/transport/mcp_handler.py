@@ -17,6 +17,7 @@ from aws_cli_mcp.utils.serialization import json_default
 
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+MAX_BATCH_REQUESTS = 50
 
 
 async def handle_mcp_request(request: Request) -> Response:
@@ -56,7 +57,7 @@ async def handle_mcp_request(request: Request) -> Response:
 
     try:
         payload = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
         return _error_response(
             None,
             "Invalid JSON",
@@ -65,6 +66,14 @@ async def handle_mcp_request(request: Request) -> Response:
 
     if isinstance(payload, list):
         return await _handle_batch(payload, request)
+    if not isinstance(payload, dict):
+        return _error_response(
+            None,
+            "Invalid JSON-RPC request",
+            status_code=400,
+            code="invalid_request",
+            protocol_version=_protocol_version(request),
+        )
 
     result = await _handle_single(payload, request)
     if result is None:
@@ -75,13 +84,19 @@ async def handle_mcp_request(request: Request) -> Response:
     if isinstance(result, Response):
         result.headers.setdefault("MCP-Protocol-Version", _protocol_version(request))
         return result
-    return JSONResponse(
-        _jsonable(result),
-        headers={"MCP-Protocol-Version": _protocol_version(request)},
-    )
+    return _json_response(result, headers={"MCP-Protocol-Version": _protocol_version(request)})
 
 
-async def _handle_batch(payloads: list[object], request: Request) -> JSONResponse:
+async def _handle_batch(payloads: list[object], request: Request) -> Response:
+    if len(payloads) > MAX_BATCH_REQUESTS:
+        return _error_response(
+            None,
+            f"Batch request too large (max {MAX_BATCH_REQUESTS})",
+            status_code=400,
+            code="batch_too_large",
+            protocol_version=_protocol_version(request),
+        )
+
     responses: list[dict[str, object]] = []
     for item in payloads:
         if not isinstance(item, dict):
@@ -89,31 +104,28 @@ async def _handle_batch(payloads: list[object], request: Request) -> JSONRespons
                 _error_body(None, "Invalid JSON-RPC batch entry", code="invalid_request")
             )
             continue
-        response = await _handle_single(item, request, allow_notification=True)
+        response = await _handle_single(item, request)
         if response is not None:
             responses.append(response)
 
     if not responses:
-        return Response(status_code=202)
-    return JSONResponse(
-        _jsonable(responses),
-        headers={"MCP-Protocol-Version": _protocol_version(request)},
-    )
+        return Response(
+            status_code=202,
+            headers={"MCP-Protocol-Version": _protocol_version(request)},
+        )
+    return _json_response(responses, headers={"MCP-Protocol-Version": _protocol_version(request)})
 
 
 async def _handle_single(
     payload: dict[str, object],
     request: Request,
-    allow_notification: bool = False,
-) -> JSONResponse | dict[str, object] | None:
+) -> dict[str, object] | None:
     request_id = payload.get("id")
     method = payload.get("method")
     params = payload.get("params", {})
     params_dict = params if isinstance(params, dict) else {}
 
     if request_id is None:
-        if not allow_notification:
-            return Response(status_code=202)
         if isinstance(method, str) and method.startswith("notifications/"):
             return None
         return None
@@ -121,10 +133,13 @@ async def _handle_single(
     if method is None and ("result" in payload or "error" in payload):
         return None
 
+    if not isinstance(method, str):
+        return _error_body(request_id, "Invalid JSON-RPC method", code="invalid_request")
+
     if method == "initialize":
         settings = load_settings()
         requested_version = params_dict.get("protocolVersion")
-        if requested_version in SUPPORTED_PROTOCOL_VERSIONS:
+        if isinstance(requested_version, str) and requested_version in SUPPORTED_PROTOCOL_VERSIONS:
             negotiated = requested_version
         else:
             negotiated = SUPPORTED_PROTOCOL_VERSIONS[-1]
@@ -151,8 +166,14 @@ async def _handle_single(
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}}
 
     if method == "tools/call":
-        name = params_dict.get("name")
-        arguments = params_dict.get("arguments", {})
+        name_obj = params_dict.get("name")
+        if not isinstance(name_obj, str):
+            return _error_body(request_id, "Invalid tool name")
+        name = name_obj
+        arguments_obj = params_dict.get("arguments", {})
+        if not isinstance(arguments_obj, dict):
+            return _error_body(request_id, "Invalid tool arguments", code="invalid_params")
+        arguments = arguments_obj
         registry = get_tool_registry()
         tool = registry.get(name)
         if tool is None:
@@ -169,8 +190,13 @@ async def _handle_single(
                 str(exc),
                 code="internal_error",
             )
-        except Exception as exc:
-            return _error_body(request_id, str(exc))
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Tool handler error: %s", name)
+            return _error_body(request_id, "Internal tool error")
 
         return {
             "jsonrpc": "2.0",
@@ -181,14 +207,14 @@ async def _handle_single(
             },
         }
 
-    return _error_body(request_id, f"Unsupported method: {method}")
+    return _error_body(request_id, f"Unsupported method: {method[:256]}")
 
 
 def _error_response(
     request_id: object,
     message: str,
     status_code: int = 400,
-    code: str = -32000,
+    code: str | int = -32000,
     protocol_version: str | None = None,
 ) -> JSONResponse:
     return JSONResponse(
@@ -210,9 +236,23 @@ def _error_body(
     }
 
 
-def _jsonable(payload: object) -> object:
-    """Convert payload to JSON-serializable structure."""
-    return json.loads(json.dumps(payload, default=json_default))
+def _json_response(
+    payload: object,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    """Serialize *payload* once and return a Response.
+
+    Avoids the previous encode→decode→encode round-trip that
+    ``JSONResponse(_jsonable(data))`` performed.
+    """
+    body = json.dumps(payload, default=json_default, ensure_ascii=False)
+    return Response(
+        content=body,
+        status_code=status_code,
+        media_type="application/json",
+        headers=headers,
+    )
 
 
 def _protocol_version(request: Request) -> str:

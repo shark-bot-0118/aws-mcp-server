@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from .context import RequestContext
 from .idp_config import RoleMappingEntry
 
 logger = logging.getLogger(__name__)
+
+_ROLE_ARN_RE = re.compile(r"^arn:aws(?:-cn|-us-gov)?:iam::\d{12}:role/[\w+=,.@/-]+$")
 
 
 @dataclass(frozen=True)
@@ -37,8 +40,24 @@ class RoleMapper:
 
         # Validate all role ARNs are properly formatted
         for mapping in mappings:
-            if not mapping.role_arn.startswith("arn:aws:iam::"):
+            if not _ROLE_ARN_RE.match(mapping.role_arn):
                 raise ValueError(f"Invalid role_arn format: {mapping.role_arn}")
+
+        # Warn about catch-all mappings (no user/group/claim constraints).
+        for i, mapping in enumerate(mappings):
+            if (
+                mapping.user_id is None
+                and mapping.email is None
+                and mapping.email_domain is None
+                and mapping.groups is None
+                and mapping.claims is None
+            ):
+                logger.warning(
+                    "Role mapping #%d (%s) has no user/group/claim constraints — "
+                    "it will match ALL authenticated users from any IdP.",
+                    i,
+                    mapping.role_arn,
+                )
 
         self._mappings = mappings
         logger.info("RoleMapper initialized with %d mappings", len(mappings))

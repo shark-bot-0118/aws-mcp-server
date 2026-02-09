@@ -22,11 +22,13 @@ class IdPConfig:
     jwks_uri: str | None = None
     allowed_algorithms: tuple[str, ...] = ("RS256", "ES256")
     clock_skew_seconds: int = 30
-    claims_mapping: dict[str, str] = field(default_factory=lambda: {
-        "user_id": "sub",
-        "email": "email",
-        "groups": "groups",
-    })
+    claims_mapping: dict[str, str] = field(
+        default_factory=lambda: {
+            "user_id": "sub",
+            "email": "email",
+            "groups": "groups",
+        }
+    )
 
     def get_audience_set(self) -> set[str]:
         """Return audience as a set for validation."""
@@ -90,9 +92,14 @@ class RoleMappingEntry:
     groups: tuple[str, ...] | None = None
     claims: dict[str, str] | None = None
 
+    # Full ARN pattern: arn:aws(-cn|-us-gov)?:iam::<12-digit>:role/<path>
+    _ROLE_ARN_RE = re.compile(
+        r"^arn:aws(?:-cn|-us-gov)?:iam::\d{12}:role/[\w+=,.@/-]+$"
+    )
+
     def __post_init__(self) -> None:
         """Validate role_arn format."""
-        if not self.role_arn.startswith("arn:aws:iam::"):
+        if not self._ROLE_ARN_RE.match(self.role_arn):
             raise ValueError(f"Invalid role_arn format: {self.role_arn}")
         if not self.account_id or not self.account_id.isdigit() or len(self.account_id) != 12:
             raise ValueError(f"Invalid account_id: {self.account_id}")
@@ -157,6 +164,7 @@ class MultiIdPConfig:
 
 def _substitute_env_vars(value: str) -> str:
     """Substitute ${VAR} and $VAR patterns with environment variables."""
+
     def replace(match: re.Match[str]) -> str:
         var_name = match.group(1) or match.group(2)
         return os.environ.get(var_name, match.group(0))

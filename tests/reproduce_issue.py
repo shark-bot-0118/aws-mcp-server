@@ -1,7 +1,5 @@
 
 import asyncio
-import json
-import os
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -72,9 +70,9 @@ async def reproduce():
             "operation": "GetSecretValue",
             "payload": {"SecretId": "my-secret"}
         }
-        
+
         print("Executing operation...")
-        result = await execute_operation(payload)
+        await execute_operation(payload)
         
         # Check artifacts
         print("Checking artifacts...")

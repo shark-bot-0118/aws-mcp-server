@@ -98,6 +98,10 @@ destructive_patterns:
   - "Destroy"
   - "Stop"
   - "Detach"
+  - "Purge"
+  - "Remove"
+  - "Revoke"
+  - "Disable"
 
 approval:
   ttl_seconds: 3600

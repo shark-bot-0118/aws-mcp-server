@@ -8,7 +8,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from aws_cli_mcp.utils.http import first_forwarded_value
+from aws_cli_mcp.utils.http import normalize_public_base_url, resolve_request_origin
 
 from .idp_config import MultiIdPConfig
 
@@ -43,15 +43,24 @@ class ProtectedResourceEndpoint:
         self,
         config: MultiIdPConfig,
         trust_forwarded_headers: bool = False,
+        public_base_url: str | None = None,
     ) -> None:
         self.config = config
         self._trust_forwarded_headers = trust_forwarded_headers
+        self._public_base_url = (
+            normalize_public_base_url(public_base_url) if public_base_url else None
+        )
         self._metadata = self._build_metadata()
 
-    @staticmethod
-    def _first_forwarded_value(value: str | None) -> str | None:
-        """Extract first value from comma-separated forwarded headers."""
-        return first_forwarded_value(value)
+    def _origin(self, request: Request | None = None) -> str | None:
+        if self._public_base_url:
+            return self._public_base_url
+        if request is None:
+            return None
+        return resolve_request_origin(
+            request,
+            trust_forwarded_headers=self._trust_forwarded_headers,
+        )
 
     def _resolve_resource(self, request: Request | None = None) -> str:
         """
@@ -60,18 +69,14 @@ class ProtectedResourceEndpoint:
         If config value is "auto", derive canonical MCP resource URL from the incoming request.
         """
         configured = self.config.protected_resource.resource.strip()
-        if configured.lower() != "auto" or request is None:
+        if configured.lower() != "auto":
             return configured
 
-        forwarded_proto = None
-        forwarded_host = None
-        if self._trust_forwarded_headers:
-            forwarded_proto = self._first_forwarded_value(request.headers.get("x-forwarded-proto"))
-            forwarded_host = self._first_forwarded_value(request.headers.get("x-forwarded-host"))
+        origin = self._origin(request)
+        if origin is None:
+            return configured
 
-        scheme = forwarded_proto or request.url.scheme
-        host = forwarded_host or request.headers.get("host") or request.url.netloc
-        return f"{scheme}://{host}/mcp"
+        return f"{origin}/mcp"
 
     def _resolve_authorization_servers(self, request: Request | None = None) -> list[str]:
         """
@@ -79,17 +84,13 @@ class ProtectedResourceEndpoint:
 
         In OAuth proxy mode, this server acts as the OAuth authorization server facade.
         """
-        if not self.config.oauth_proxy.enabled or request is None:
+        if not self.config.oauth_proxy.enabled:
             return self.config.get_authorization_servers()
 
-        forwarded_proto = None
-        forwarded_host = None
-        if self._trust_forwarded_headers:
-            forwarded_proto = self._first_forwarded_value(request.headers.get("x-forwarded-proto"))
-            forwarded_host = self._first_forwarded_value(request.headers.get("x-forwarded-host"))
-        scheme = forwarded_proto or request.url.scheme
-        host = forwarded_host or request.headers.get("host") or request.url.netloc
-        return [f"{scheme}://{host}"]
+        origin = self._origin(request)
+        if origin is None:
+            return self.config.get_authorization_servers()
+        return [origin]
 
     def _build_metadata(self, request: Request | None = None) -> ProtectedResourceMetadata:
         """Build metadata from configuration."""
@@ -123,9 +124,11 @@ class ProtectedResourceEndpoint:
 def create_protected_resource_endpoint(
     config: MultiIdPConfig,
     trust_forwarded_headers: bool = False,
+    public_base_url: str | None = None,
 ) -> ProtectedResourceEndpoint:
     """Factory function to create Protected Resource endpoint."""
     return ProtectedResourceEndpoint(
         config,
         trust_forwarded_headers=trust_forwarded_headers,
+        public_base_url=public_base_url,
     )
