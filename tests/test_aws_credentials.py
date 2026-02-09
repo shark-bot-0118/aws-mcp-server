@@ -107,6 +107,34 @@ class TestCredentialCache:
             await cache.get_or_refresh(key, refresh)
 
     @pytest.mark.asyncio
+    async def test_get_or_refresh_cleans_in_flight_on_cancellation(self) -> None:
+        cache = CredentialCache(refresh_buffer_seconds=300, max_entries=10)
+        key = CacheKey(user_id="u1", account_id="123", role_arn="arn:role/read")
+        gate = asyncio.Event()
+
+        async def blocked_refresh() -> TemporaryCredentials:
+            await gate.wait()
+            return _temp_creds()
+
+        first = asyncio.create_task(cache.get_or_refresh(key, blocked_refresh))
+        for _ in range(100):
+            if key in cache._in_flight:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("single-flight state was not established")
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        async def fast_refresh() -> TemporaryCredentials:
+            return _temp_creds(datetime.now(timezone.utc) + timedelta(hours=2))
+
+        result = await asyncio.wait_for(cache.get_or_refresh(key, fast_refresh), timeout=0.5)
+        assert result.expiration > datetime.now(timezone.utc)
+
+    @pytest.mark.asyncio
     async def test_get_or_refresh_evicts_lru_entry(self) -> None:
         cache = CredentialCache(refresh_buffer_seconds=300, max_entries=1)
         key1 = CacheKey(user_id="u1", account_id="123", role_arn="arn:role/read")

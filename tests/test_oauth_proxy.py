@@ -268,6 +268,14 @@ class TestOAuthProxyBroker:
         assert "valid" in broker._codes
         assert "valid" in broker._clients
 
+    def test_cleanup_expired_if_due_interval(self, broker: OAuthProxyBroker) -> None:
+        with patch.object(broker, "_cleanup_expired") as cleanup:
+            broker._cleanup_expired_if_due(now=100.0)
+            broker._cleanup_expired_if_due(now=105.0)
+            broker._cleanup_expired_if_due(now=111.0)
+
+        assert cleanup.call_count == 2
+
     @pytest.mark.asyncio
     async def test_callback_error_param(self, broker: OAuthProxyBroker) -> None:
         """Test callback with error param from upstream."""
@@ -432,9 +440,12 @@ class TestOAuthProxyBroker:
         assert broker._validate_redirect_uri("http://example.com/cb")
         assert broker._validate_redirect_uri("https://")
         assert broker._validate_redirect_uri("http://[::1]:8000/cb") is None
+        assert broker._validate_redirect_uri("myapp://localhost/cb")
+        assert broker._validate_redirect_uri("file://localhost/cb")
         with patch("aws_cli_mcp.auth.oauth_proxy.urlparse", side_effect=ValueError("boom")):
             assert broker._validate_redirect_uri("x")
             assert broker._is_loopback_redirect_uri("http://localhost/cb") is False
+        assert broker._is_loopback_redirect_uri("myapp://localhost/cb") is False
         assert broker._is_loopback_redirect_uri("http://localhost:8000/cb") is True
         assert broker._is_loopback_redirect_uri("http://[::1]:8000/cb") is True
 

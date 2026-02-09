@@ -20,8 +20,8 @@ from aws_cli_mcp.tools.aws_unified import (
 
 @pytest.fixture
 def mock_ctx():
-    with patch("aws_cli_mcp.tools.aws_unified.get_app_context") as mock_get:
-        with patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot") as mock_load_snapshot:
+    with patch("aws_cli_mcp.tools._handlers.get_app_context") as mock_get:
+        with patch("aws_cli_mcp.tools._handlers.load_model_snapshot") as mock_load_snapshot:
             ctx = MagicMock()
             mock_get.return_value = ctx
 
@@ -138,7 +138,7 @@ async def test_execute_validate_success(mock_ctx):
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
     # Mock validation success (returns empty list of errors)
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         # Mock policy allow
         mock_decision = MagicMock()
         mock_decision.allowed = True
@@ -164,13 +164,13 @@ async def test_execute_invoke_success(mock_ctx, mock_sleep):
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
     # Mock inject_idempotency
-    with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
+    with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
         # Mock coerce
-        with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
+        with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
             # Mock boto3 call
-            with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={"Buckets": []}):
+            with patch("aws_cli_mcp.tools._handlers._call_boto3", return_value={"Buckets": []}):
                 # Mock validation
-                with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+                with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
                     # Mock policy
                     mock_decision = MagicMock()
                     mock_decision.allowed = True
@@ -195,10 +195,10 @@ async def test_execute_invoke_normalizes_operation_name_for_call(mock_ctx):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
 
-    with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
-        with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
-            with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={"Buckets": []}) as mock_call:
-                with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
+        with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
+            with patch("aws_cli_mcp.tools._handlers._call_boto3", return_value={"Buckets": []}) as mock_call:
+                with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
                     mock_decision = MagicMock()
                     mock_decision.allowed = True
                     mock_decision.require_approval = False
@@ -265,7 +265,7 @@ async def test_confirmation_flow(mock_ctx):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_decision = MagicMock()
         mock_decision.allowed = True
         mock_decision.require_approval = True
@@ -301,14 +301,14 @@ async def test_confirmation_flow(mock_ctx):
         mock_op.service = "s3"
         mock_op.operation = "DeleteBucket"
         # We need to match hash. Let's mock _compute_request_hash
-        with patch("aws_cli_mcp.tools.aws_unified._compute_request_hash", return_value="hash-123"):
+        with patch("aws_cli_mcp.tools._handlers._compute_request_hash", return_value="hash-123"):
              mock_op.request_hash = "hash-123"
              mock_ctx.store.get_pending_op.return_value = mock_op
 
              # Mock internal calls for execution
-             with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
-                 with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
-                     with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={"Success": True}):
+             with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
+                 with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
+                     with patch("aws_cli_mcp.tools._handlers._call_boto3", return_value={"Success": True}):
 
                          result = await execute_operation({
                              "action": "invoke",
@@ -342,7 +342,7 @@ async def test_execute_global_approval_requires_confirmation(mock_ctx):
     mock_ctx.settings.server.require_approval = True
     mock_ctx.settings.server.auto_approve_destructive = True
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_decision = MagicMock()
         mock_decision.allowed = True
         mock_decision.require_approval = False
@@ -375,7 +375,7 @@ async def test_execute_auto_approve_destructive_keeps_risk_confirmation(mock_ctx
     mock_ctx.settings.server.require_approval = False
     mock_ctx.settings.server.auto_approve_destructive = True
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_decision = MagicMock()
         mock_decision.allowed = True
         mock_decision.require_approval = True
@@ -407,7 +407,7 @@ async def test_execute_auto_approve_destructive_only_bypasses_confirmation(mock_
     mock_ctx.settings.server.require_approval = False
     mock_ctx.settings.server.auto_approve_destructive = True
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_decision = MagicMock()
         mock_decision.allowed = True
         mock_decision.require_approval = True
@@ -417,9 +417,9 @@ async def test_execute_auto_approve_destructive_only_bypasses_confirmation(mock_
         mock_decision.reasons = []
         mock_ctx.policy_engine.evaluate.return_value = mock_decision
 
-        with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
-            with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
-                with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={"ok": True}):
+        with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
+            with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
+                with patch("aws_cli_mcp.tools._handlers._call_boto3", return_value={"ok": True}):
                     result = await execute_operation(
                         {
                             "action": "invoke",
@@ -484,12 +484,12 @@ async def test_execute_json_string_parsing(mock_ctx):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_ctx.policy_engine.evaluate.return_value.allowed = True
         mock_ctx.policy_engine.evaluate.return_value.require_approval = False
         
         # Valid JSON strings
-        with patch("aws_cli_mcp.tools.aws_unified._call_boto3", return_value={}):
+        with patch("aws_cli_mcp.tools._handlers._call_boto3", return_value={}):
             result = await execute_operation({
                 "action": "invoke",
                 "service": "s3",
@@ -553,7 +553,7 @@ async def test_execute_validation_error(mock_ctx):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured") as mock_validate:
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured") as mock_validate:
         from aws_cli_mcp.utils.jsonschema import ValidationError
         mock_validate.return_value = [ValidationError(type="missing_required", message="Error 1")]
         
@@ -572,7 +572,7 @@ async def test_execute_policy_denied(mock_ctx):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_ctx.policy_engine.evaluate.return_value.allowed = False
         mock_ctx.policy_engine.evaluate.return_value.reasons = ["Denied"]
         
@@ -591,11 +591,11 @@ async def test_execute_type_coercion_error(mock_ctx):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_ctx.policy_engine.evaluate.return_value.allowed = True
         mock_ctx.policy_engine.evaluate.return_value.require_approval = False
         
-        with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", side_effect=ValueError("Coercion failed")):
+        with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", side_effect=ValueError("Coercion failed")):
             result = await execute_operation({
                 "action": "invoke",
                 "service": "s3",
@@ -611,15 +611,15 @@ async def test_execute_boto3_error_handling(mock_ctx, mock_sleep):
     mock_entry.operation_shape_id = "op-id"
     mock_ctx.catalog.find_operation.return_value = mock_entry
     
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_ctx.policy_engine.evaluate.return_value.allowed = True
         mock_ctx.policy_engine.evaluate.return_value.require_approval = False
         
-        with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
-            with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
+        with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
+            with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
                 
                 # Case 1: Generic Exception
-                with patch("aws_cli_mcp.tools.aws_unified._call_boto3", side_effect=Exception("Generic Error")):
+                with patch("aws_cli_mcp.tools._handlers._call_boto3", side_effect=Exception("Generic Error")):
                      result = await execute_operation({
                         "action": "invoke",
                         "service": "s3",
@@ -632,7 +632,7 @@ async def test_execute_boto3_error_handling(mock_ctx, mock_sleep):
 
                 # Case 2: Retryable ClientError (Throttling)
                 mock_ctx.settings.execution.max_retries = 1
-                with patch("aws_cli_mcp.tools.aws_unified._call_boto3") as mock_call:
+                with patch("aws_cli_mcp.tools._handlers._call_boto3") as mock_call:
                     mock_call.side_effect = [
                         ClientError({"Error": {"Code": "Throttling"}}, "op"),
                         {"Success": True}
@@ -655,13 +655,13 @@ async def test_execute_cleanup_exception_and_request_context_error(mock_ctx):
     mock_ctx.catalog.find_operation.return_value = mock_entry
     mock_ctx.store.cleanup_pending_txs.side_effect = RuntimeError("cleanup failed")
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         mock_ctx.policy_engine.evaluate.return_value.allowed = True
         mock_ctx.policy_engine.evaluate.return_value.require_approval = False
-        with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
-            with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
+        with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
+            with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
                 with patch(
-                    "aws_cli_mcp.tools.aws_unified._call_boto3",
+                    "aws_cli_mcp.tools._handlers._call_boto3",
                     side_effect=RequestContextError("context missing"),
                 ):
                     with pytest.raises(RequestContextError):
@@ -688,7 +688,7 @@ async def test_execute_confirmation_token_error_branches(mock_ctx):
     decision.reasons = []
     mock_ctx.policy_engine.evaluate.return_value = decision
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
         token = "CONFIRM"
 
         # status mismatch -> line 402
@@ -737,7 +737,7 @@ async def test_execute_confirmation_token_error_branches(mock_ctx):
         # operation mismatch -> line 425
         op = MagicMock(service="ec2", operation="TerminateInstances", request_hash="h")
         mock_ctx.store.get_pending_op.return_value = op
-        with patch("aws_cli_mcp.tools.aws_unified._compute_request_hash", return_value="h"):
+        with patch("aws_cli_mcp.tools._handlers._compute_request_hash", return_value="h"):
             result = await execute_operation(
                 {
                     "action": "invoke",
@@ -752,7 +752,7 @@ async def test_execute_confirmation_token_error_branches(mock_ctx):
         # hash mismatch -> line 433
         op = MagicMock(service="s3", operation="DeleteBucket", request_hash="h1")
         mock_ctx.store.get_pending_op.return_value = op
-        with patch("aws_cli_mcp.tools.aws_unified._compute_request_hash", return_value="h2"):
+        with patch("aws_cli_mcp.tools._handlers._compute_request_hash", return_value="h2"):
             result = await execute_operation(
                 {
                     "action": "invoke",
@@ -782,8 +782,8 @@ async def test_execute_confirmation_token_missing_current_actor_branch(mock_ctx)
     mock_ctx.store.get_tx.return_value = tx
 
     with (
-        patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]),
-        patch("aws_cli_mcp.tools.aws_unified._actor_from_request_context", return_value=None),
+        patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]),
+        patch("aws_cli_mcp.tools._handlers._actor_from_request_context", return_value=None),
     ):
         result = await execute_operation(
             {
@@ -818,8 +818,8 @@ async def test_execute_confirmation_token_claim_conflict_branch(mock_ctx):
     mock_ctx.store.claim_pending_tx.return_value = False
 
     with (
-        patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]),
-        patch("aws_cli_mcp.tools.aws_unified._compute_request_hash", return_value="hash"),
+        patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]),
+        patch("aws_cli_mcp.tools._handlers._compute_request_hash", return_value="hash"),
     ):
         result = await execute_operation(
             {
@@ -847,13 +847,13 @@ async def test_execute_identity_center_credential_error_branch(mock_ctx):
     mock_ctx.policy_engine.evaluate.return_value.allowed = True
     mock_ctx.policy_engine.evaluate.return_value.require_approval = False
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]), \
-         patch("aws_cli_mcp.tools.aws_unified._resolve_identity_center_role_selection", AsyncMock(return_value=("123456789012", "ReadOnly"))), \
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]), \
+         patch("aws_cli_mcp.tools._handlers._resolve_identity_center_role_selection", AsyncMock(return_value=("123456789012", "ReadOnly"))), \
          patch(
-             "aws_cli_mcp.tools.aws_unified._ensure_identity_center_credentials",
+             "aws_cli_mcp.tools._handlers._ensure_identity_center_credentials",
              AsyncMock(return_value=_error_response("IdentityCenterError", "bad creds")),
          ), \
-         patch("aws_cli_mcp.tools.aws_unified._record_audit_log", AsyncMock()):
+         patch("aws_cli_mcp.tools._handlers._record_audit_log", AsyncMock()):
         result = await execute_operation(
             {
                 "action": "invoke",
@@ -879,9 +879,9 @@ async def test_execute_identity_center_role_selection_error_short_circuit(mock_c
     mock_ctx.policy_engine.evaluate.return_value.allowed = True
     mock_ctx.policy_engine.evaluate.return_value.require_approval = False
 
-    with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]), \
+    with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]), \
          patch(
-             "aws_cli_mcp.tools.aws_unified._resolve_identity_center_role_selection",
+             "aws_cli_mcp.tools._handlers._resolve_identity_center_role_selection",
              AsyncMock(return_value=_error_response("RoleSelectionRequired", "pick a role")),
          ):
         result = await execute_operation(

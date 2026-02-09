@@ -297,6 +297,17 @@ async def test_batch_request_too_large(mock_app):
 
 
 @pytest.mark.asyncio
+async def test_empty_batch_returns_invalid_request(mock_app):
+    req = make_request(mock_app, json_body=[])
+    resp = await handle_mcp_request(req)
+
+    assert resp.status_code == 400
+    body = json.loads(resp.body)
+    assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["message"] == "Invalid JSON-RPC batch request"
+
+
+@pytest.mark.asyncio
 async def test_notifications(mock_app):
     # No ID = Notification?
     # Logic in _handle_single: if request_id is None ...

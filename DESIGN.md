@@ -2,7 +2,7 @@
 
 ## Meta
 - **Project Title:** AWS Tool-Execution MCP Server
-- **Version:** 3.19
+- **Version:** 3.21
 - **Last Updated:** 2026-02-09
 - **Document Role:** Architecture / design SSOT
 - **History & Versioning:** `/Users/shuto/Projects/mcp_server/aws_cli_v2/HISTORY.md`
@@ -32,7 +32,13 @@ src/aws_cli_mcp/
 ├── mcp_runtime.py
 ├── tools/
 │   ├── __init__.py
-│   ├── aws_unified.py          # 3 unified tools
+│   ├── aws_unified.py          # Re-export facade (keeps import paths stable)
+│   ├── _schemas.py             # JSON Schema defs & ToolSpec factory
+│   ├── _handlers.py            # search_operations, get_operation_schema, execute_operation
+│   ├── _helpers.py             # _error_response, _redact, _run_blocking, _snake_case, …
+│   ├── _coercion.py            # Payload type coercion (blob, int, bool, timestamp, …)
+│   ├── _response_limiting.py   # Response compaction & truncation
+│   ├── _identity_center.py     # IAM Identity Center role selection & credentials
 │   └── base.py
 ├── auth/
 │   ├── __init__.py
@@ -88,6 +94,7 @@ src/aws_cli_mcp/
     ├── jsonschema.py
     ├── hashing.py
     ├── http.py
+    ├── masking.py              # Shared sensitive-field redaction
     ├── serialization.py
     └── time.py
 ```
@@ -700,8 +707,20 @@ Validate and invoke AWS operations.
   - hard gate: `pip-audit --progress-spinner off`
 - CI observability policy:
   - `quality` and `sca` jobs must run even when `test` fails, so static-analysis/security results are never hidden by upstream skips.
+  - CI job graph keeps `quality`/`sca` independent from `test` (`needs` decoupled) to avoid skipped status on test failure.
 - Pytest async policy:
   - `pytest-asyncio` is a required dev dependency because pytest config uses async loop-scope options.
+  - For deterministic CI behavior, pin `pytest-asyncio` to `>=0.24,<1.0` while loop-scope config keys are in use.
+- Async cache reliability policy:
+  - single-flight credential cache must clear `in_flight` state on cancellation paths (`CancelledError`) to prevent stuck waits.
+- OAuth proxy redirect policy:
+  - redirect URIs must use `http` or `https`; loopback relaxes only the TLS requirement (allows `http`) but not arbitrary schemes.
+- HTTP JSON-RPC policy:
+  - empty batch requests are invalid (`invalid_request`) and must return 400.
+- Audit log safety policy:
+  - all user-controlled log fields (including request IDs and principal IDs) must be sanitized before emission.
+- OAuth proxy cleanup policy:
+  - in-memory transaction/code/client cleanup must be interval-driven (not full-map rebuild on every request) to avoid O(n) hot-path cost.
 - Optional advisory jobs may exist for experiments, but merge safety must not depend on runtime flags.
 - Local SCA verification should run with the project virtualenv binary
   (`.venv/bin/pip-audit --progress-spinner off`) to avoid host PATH drift.

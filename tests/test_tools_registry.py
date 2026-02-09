@@ -18,9 +18,9 @@ def test_get_tool_specs_and_registry() -> None:
 
 def test_register_tools_adds_all_specs() -> None:
     server = MagicMock()
-    with patch("aws_cli_mcp.tools.get_logger") as mock_get_logger:
+    with patch("aws_cli_mcp.tools.logging") as mock_logging:
         logger = MagicMock()
-        mock_get_logger.return_value = logger
+        mock_logging.getLogger.return_value = logger
         register_tools(server)
 
     assert server.add_tool.call_count == 3

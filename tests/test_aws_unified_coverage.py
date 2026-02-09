@@ -401,7 +401,7 @@ async def test_retry_break():
     
     from botocore.exceptions import BotoCoreError
     
-    with patch("aws_cli_mcp.tools.aws_unified._call_boto3") as mock_call:
+    with patch("aws_cli_mcp.tools._handlers._call_boto3") as mock_call:
         with patch("asyncio.sleep"):
             mock_call.side_effect = BotoCoreError(error_code="Throttling", msg="Throttle")
             
@@ -413,8 +413,8 @@ async def test_retry_break():
             ctx.store.update_tx_status = MagicMock()
             
             # We need validation to pass first
-            with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
-                 with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx):
+            with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
+                 with patch("aws_cli_mcp.tools._handlers.get_app_context", return_value=ctx):
                      # Mock policy
                      mock_decision = MagicMock()
                      mock_decision.allowed = True
@@ -431,16 +431,16 @@ async def test_retry_break():
                      ctx.catalog.find_operation.return_value = mock_entry
                      
                      # Mock load_model_snapshot
-                     with patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot") as mock_load:
+                     with patch("aws_cli_mcp.tools._handlers.load_model_snapshot") as mock_load:
                          mock_snapshot = MagicMock()
                          mock_snapshot.catalog = ctx.catalog
                          mock_snapshot.model = MagicMock()
                          mock_load.return_value = mock_snapshot
                          
                          # Mock coerce
-                         with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
+                         with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
                              # Mock inject
-                             with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
+                             with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
                              
                                  result = await execute_operation({
                                      "action": "invoke", "service": "s", "operation": "o", "payload": {}
@@ -455,7 +455,7 @@ async def test_retry_break():
 @pytest.mark.asyncio
 async def test_keyboard_interrupt_re_raised_in_retry_loop():
     """KeyboardInterrupt inside the retry loop should be re-raised immediately."""
-    with patch("aws_cli_mcp.tools.aws_unified._call_boto3", new_callable=AsyncMock) as mock_call:
+    with patch("aws_cli_mcp.tools._handlers._call_boto3", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = KeyboardInterrupt()
 
         ctx = MagicMock()
@@ -465,8 +465,8 @@ async def test_keyboard_interrupt_re_raised_in_retry_loop():
         ctx.store.update_op_status = MagicMock()
         ctx.store.update_tx_status = MagicMock()
 
-        with patch("aws_cli_mcp.tools.aws_unified.validate_payload_structured", return_value=[]):
-            with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx):
+        with patch("aws_cli_mcp.tools._handlers.validate_payload_structured", return_value=[]):
+            with patch("aws_cli_mcp.tools._handlers.get_app_context", return_value=ctx):
                 mock_decision = MagicMock()
                 mock_decision.allowed = True
                 mock_decision.require_approval = False
@@ -479,14 +479,14 @@ async def test_keyboard_interrupt_re_raised_in_retry_loop():
                 mock_entry.operation_shape_id = "op-id"
                 ctx.catalog.find_operation.return_value = mock_entry
 
-                with patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot") as mock_load:
+                with patch("aws_cli_mcp.tools._handlers.load_model_snapshot") as mock_load:
                     mock_snapshot = MagicMock()
                     mock_snapshot.catalog = ctx.catalog
                     mock_snapshot.model = MagicMock()
                     mock_load.return_value = mock_snapshot
 
-                    with patch("aws_cli_mcp.tools.aws_unified._coerce_payload_types", return_value={}):
-                        with patch("aws_cli_mcp.tools.aws_unified.inject_idempotency_tokens", return_value=({}, [])):
+                    with patch("aws_cli_mcp.tools._handlers._coerce_payload_types", return_value={}):
+                        with patch("aws_cli_mcp.tools._handlers.inject_idempotency_tokens", return_value=({}, [])):
                             with pytest.raises(KeyboardInterrupt):
                                 await execute_operation({
                                     "action": "invoke", "service": "s", "operation": "o", "payload": {}
@@ -516,8 +516,8 @@ def test_search_operations_service_hint_limit_and_get_schema_not_allowlisted():
     )
     snapshot.schema_generator.generate_operation_input_schema.return_value = {"type": "object"}
 
-    with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx), \
-         patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot", return_value=snapshot):
+    with patch("aws_cli_mcp.tools._handlers.get_app_context", return_value=ctx), \
+         patch("aws_cli_mcp.tools._handlers.load_model_snapshot", return_value=snapshot):
         result = search_operations({"query": "list", "serviceHint": "S3", "limit": 2})
         payload = json.loads(result.content[0]["text"])
         assert payload["count"] == 2
@@ -526,8 +526,8 @@ def test_search_operations_service_hint_limit_and_get_schema_not_allowlisted():
     deny_ctx = MagicMock()
     deny_ctx.policy_engine.is_service_allowed.return_value = True
     deny_ctx.policy_engine.is_operation_allowed.return_value = False
-    with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=deny_ctx), \
-         patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot", return_value=snapshot):
+    with patch("aws_cli_mcp.tools._handlers.get_app_context", return_value=deny_ctx), \
+         patch("aws_cli_mcp.tools._handlers.load_model_snapshot", return_value=snapshot):
         with pytest.raises(ValueError, match="allowlisted"):
             get_operation_schema({"service": "s3", "operation": "ListBuckets"})
 
@@ -545,9 +545,9 @@ def test_search_operations_limit_parsing_fallback_branches() -> None:
     snapshot.catalog.search.return_value = [entry]
 
     with (
-        patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx),
-        patch("aws_cli_mcp.tools.aws_unified.load_model_snapshot", return_value=snapshot),
-        patch("aws_cli_mcp.tools.aws_unified.validate_or_raise"),
+        patch("aws_cli_mcp.tools._handlers.get_app_context", return_value=ctx),
+        patch("aws_cli_mcp.tools._handlers.load_model_snapshot", return_value=snapshot),
+        patch("aws_cli_mcp.tools._handlers.validate_or_raise"),
     ):
         bool_limit = search_operations({"query": "list", "limit": True})
         bool_payload = json.loads(bool_limit.content[0]["text"])
@@ -613,7 +613,7 @@ async def test_resolve_identity_center_role_selection_branches():
             side_effect=IdentityCenterError("unexpected", "sso_error")
         )
         provider.list_accounts = AsyncMock(return_value=[])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             err = await _resolve_identity_center_role_selection(
                 ctx,
                 {"accountId": "123456789012", "roleName": "Admin"},
@@ -622,7 +622,7 @@ async def test_resolve_identity_center_role_selection_branches():
 
         provider = MagicMock()
         provider.list_account_roles = AsyncMock(return_value=[])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             not_assigned = await _resolve_identity_center_role_selection(
                 ctx,
                 {"accountId": "123456789012", "roleName": "Admin"},
@@ -632,7 +632,7 @@ async def test_resolve_identity_center_role_selection_branches():
         role = MagicMock(account_id="123456789012", role_name="Admin")
         provider = MagicMock()
         provider.list_account_roles = AsyncMock(return_value=[role])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             ok = await _resolve_identity_center_role_selection(
                 ctx,
                 {"accountId": "123456789012", "roleName": "Admin"},
@@ -641,7 +641,7 @@ async def test_resolve_identity_center_role_selection_branches():
 
         provider = MagicMock()
         provider.list_accounts = AsyncMock(side_effect=IdentityCenterError("boom", "sso_error"))
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             failed_accounts = await _resolve_identity_center_role_selection(ctx, {})
             assert "IdentityCenterError" in failed_accounts.content[0]["text"]
 
@@ -649,19 +649,19 @@ async def test_resolve_identity_center_role_selection_branches():
         provider = MagicMock()
         provider.list_accounts = AsyncMock(return_value=[account])
         provider.list_account_roles = AsyncMock(return_value=[])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             none_roles = await _resolve_identity_center_role_selection(ctx, {})
             assert "NoRolesAvailable" in none_roles.content[0]["text"]
 
         role = MagicMock(account_id="123", role_name="ReadOnly")
         provider.list_account_roles = AsyncMock(return_value=[role])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             single = await _resolve_identity_center_role_selection(ctx, {})
             assert single == ("123", "ReadOnly")
 
         role2 = MagicMock(account_id="123", role_name="Admin")
         provider.list_account_roles = AsyncMock(return_value=[role, role2])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             multi = await _resolve_identity_center_role_selection(ctx, {})
             assert "RoleSelectionRequired" in multi.content[0]["text"]
 
@@ -670,7 +670,7 @@ async def test_resolve_identity_center_role_selection_branches():
         provider.list_account_roles = AsyncMock(
             return_value=[MagicMock(account_id="123456789012", role_name="ParsedRole")]
         )
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             parsed = await _resolve_identity_center_role_selection(
                 ctx,
                 {"roleArn": "arn:aws:iam::123456789012:role/ParsedRole"},
@@ -680,8 +680,8 @@ async def test_resolve_identity_center_role_selection_branches():
         provider = MagicMock()
         provider.list_accounts = AsyncMock(return_value=[])
         provider.list_account_roles = AsyncMock(return_value=[])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider), \
-             patch("aws_cli_mcp.tools.aws_unified.asyncio.gather", side_effect=Exception("gather failed")):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider), \
+             patch("aws_cli_mcp.tools._identity_center.asyncio.gather", side_effect=Exception("gather failed")):
             gather_err = await _resolve_identity_center_role_selection(ctx, {})
             assert "IdentityCenterError" in gather_err.content[0]["text"]
 
@@ -691,23 +691,23 @@ async def test_resolve_identity_center_role_selection_branches():
         provider.list_account_roles = AsyncMock(
             side_effect=IdentityCenterError("bad", "sso_error")
         )
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             idc_result_err = await _resolve_identity_center_role_selection(ctx, {})
             assert "IdentityCenterError" in idc_result_err.content[0]["text"]
 
         provider = MagicMock()
         provider.list_accounts = AsyncMock(return_value=[account])
         provider.list_account_roles = AsyncMock(side_effect=RuntimeError("oops"))
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             generic_result_err = await _resolve_identity_center_role_selection(ctx, {})
             assert "Unexpected error fetching roles" in generic_result_err.content[0]["text"]
 
         provider = MagicMock()
         provider.list_accounts = AsyncMock(return_value=[])
         provider.list_account_roles = AsyncMock(return_value=[])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider), \
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider), \
              patch(
-                 "aws_cli_mcp.tools.aws_unified.asyncio.gather",
+                 "aws_cli_mcp.tools._identity_center.asyncio.gather",
                  new=AsyncMock(return_value=[("bad", "not-a-list")]),
              ):
             bad_result_type = await _resolve_identity_center_role_selection(ctx, {})
@@ -717,7 +717,7 @@ async def test_resolve_identity_center_role_selection_branches():
         provider = MagicMock()
         provider.list_accounts = AsyncMock(return_value=[account])
         provider.list_account_roles = AsyncMock(return_value=[invalid_role])
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             filtered_roles = await _resolve_identity_center_role_selection(ctx, {})
             assert "NoRolesAvailable" in filtered_roles.content[0]["text"]
     finally:
@@ -741,7 +741,7 @@ async def test_ensure_identity_center_credentials_branches():
         provider.get_cached_role_credentials = AsyncMock(
             side_effect=IdentityCenterError("bad creds", "sso_error")
         )
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             err = await _ensure_identity_center_credentials(ctx, "123", "Role")
             assert "IdentityCenterError" in err.content[0]["text"]
 
@@ -751,7 +751,7 @@ async def test_ensure_identity_center_credentials_branches():
         temp.session_token = "st"
         temp.expiration = datetime.now(timezone.utc)
         provider.get_cached_role_credentials = AsyncMock(return_value=temp)
-        with patch("aws_cli_mcp.tools.aws_unified.get_identity_center_provider", return_value=provider):
+        with patch("aws_cli_mcp.tools._identity_center.get_identity_center_provider", return_value=provider):
             ok = await _ensure_identity_center_credentials(ctx, "123456789012", "Role")
             assert ok is None
             req = get_request_context_optional()
@@ -785,11 +785,11 @@ async def test_call_boto3_and_parse_option_helpers():
 
     client = MagicMock()
     client.list_buckets = MagicMock(return_value={"Buckets": []})
-    with patch("aws_cli_mcp.tools.aws_unified.get_client_async", AsyncMock(return_value=client)), \
-         patch("aws_cli_mcp.tools.aws_unified.call_aws_api_async", AsyncMock(return_value={"Buckets": []})):
+    with patch("aws_cli_mcp.tools._helpers.get_client_async", AsyncMock(return_value=client)), \
+         patch("aws_cli_mcp.tools._helpers.call_aws_api_async", AsyncMock(return_value={"Buckets": []})):
         out = await _call_boto3("s3", "ListBuckets", {}, "us-east-1", 100)
         assert out == {"Buckets": []}
-    with patch("aws_cli_mcp.tools.aws_unified.get_client_async", AsyncMock(return_value=object())):
+    with patch("aws_cli_mcp.tools._helpers.get_client_async", AsyncMock(return_value=object())):
         with pytest.raises(AttributeError):
             await _call_boto3("s3", "NoSuchMethod", {}, "us-east-1", 100)
 

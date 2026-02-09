@@ -51,10 +51,10 @@ async def reproduce():
     sensitive_value = "SUPER_SECRET_VALUE"
     mock_response = {"SecretString": sensitive_value}
     
-    with patch("aws_cli_mcp.tools.aws_unified.get_app_context", return_value=ctx), \
-         patch("aws_cli_mcp.tools.aws_unified.get_client_async"), \
-         patch("aws_cli_mcp.tools.aws_unified.call_aws_api_async", return_value=mock_response), \
-         patch("aws_cli_mcp.tools.aws_unified._resolve_snapshot") as mock_resolve:
+    with patch("aws_cli_mcp.tools._handlers.get_app_context", return_value=ctx), \
+         patch("aws_cli_mcp.tools._helpers.get_client_async"), \
+         patch("aws_cli_mcp.tools._helpers.call_aws_api_async", return_value=mock_response), \
+         patch("aws_cli_mcp.tools._handlers._resolve_snapshot") as mock_resolve:
          
         # Mock snapshot
         mock_model = MagicMock()

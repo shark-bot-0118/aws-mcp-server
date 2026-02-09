@@ -37,6 +37,7 @@ _MIN_CODE_VERIFIER_LENGTH: int = 43
 _MAX_TRANSACTIONS: int = 10_000
 _MAX_AUTHORIZATION_CODES: int = 10_000
 _MAX_REGISTERED_CLIENTS: int = 10_000
+_CLEANUP_INTERVAL_SECONDS: int = 10
 
 _PKCE_ALLOWED_PATTERN = re.compile(r"^[A-Za-z0-9\-._~]+$")
 _BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -114,6 +115,7 @@ class OAuthProxyBroker:
         self._clients: dict[str, RegisteredClient] = {}
         self._oidc_metadata: dict[str, Any] | None = None
         self._oidc_metadata_fetched_at: float = 0.0
+        self._last_cleanup_at: float = 0.0
         self._state_lock = asyncio.Lock()
 
     @staticmethod
@@ -134,8 +136,11 @@ class OAuthProxyBroker:
             return f"Invalid URI: {uri}"
         if not parsed.scheme or not parsed.netloc:
             return f"Malformed redirect_uri: {uri}"
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"}:
+            return f"redirect_uri must use http or https (got {parsed.scheme}): {uri}"
         is_localhost = OAuthProxyBroker._is_loopback_host(parsed.hostname)
-        if not is_localhost and parsed.scheme != "https":
+        if not is_localhost and scheme != "https":
             return f"redirect_uri must use https (got {parsed.scheme}): {uri}"
         return None
 
@@ -144,6 +149,8 @@ class OAuthProxyBroker:
         try:
             parsed = urlparse(uri)
         except Exception:
+            return False
+        if parsed.scheme.lower() not in {"http", "https"}:
             return False
         return OAuthProxyBroker._is_loopback_host(parsed.hostname)
 
@@ -234,8 +241,8 @@ class OAuthProxyBroker:
             },
         )
 
-    def _cleanup_expired(self) -> None:
-        now = time.time()
+    def _cleanup_expired(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
         txn_ttl = self.proxy.transaction_ttl_seconds
         code_ttl = self.proxy.auth_code_ttl_seconds
 
@@ -252,6 +259,13 @@ class OAuthProxyBroker:
             for key, value in self._clients.items()
             if now - value.created_at <= _CLIENT_TTL_SECONDS
         }
+
+    def _cleanup_expired_if_due(self, now: float | None = None) -> None:
+        current = time.time() if now is None else now
+        if current - self._last_cleanup_at < _CLEANUP_INTERVAL_SECONDS:
+            return
+        self._cleanup_expired(current)
+        self._last_cleanup_at = current
 
     def _has_capacity(self, current_size: int, limit: int) -> bool:
         return current_size < limit
@@ -309,7 +323,7 @@ class OAuthProxyBroker:
             return self._oauth_error("invalid_request", "code_challenge format is invalid")
 
         async with self._state_lock:
-            self._cleanup_expired()
+            self._cleanup_expired_if_due()
 
             if self._clients.get(client_id):
                 if not self._is_registered_redirect_uri(client_id, redirect_uri):
@@ -364,7 +378,7 @@ class OAuthProxyBroker:
         qp = request.query_params
         txn_id = (qp.get("state") or "").strip()
         async with self._state_lock:
-            self._cleanup_expired()
+            self._cleanup_expired_if_due()
             transaction = self._transactions.pop(txn_id, None)
         if not transaction:
             return self._oauth_error("invalid_request", "OAuth transaction not found", 400)
@@ -465,7 +479,7 @@ class OAuthProxyBroker:
     async def token(self, request: Request) -> Response:
         """Client-facing /token endpoint."""
         async with self._state_lock:
-            self._cleanup_expired()
+            self._cleanup_expired_if_due()
         raw_body = (await request.body()).decode("utf-8", errors="replace")
         form_values = parse_qs(raw_body, keep_blank_values=True)
 
@@ -630,6 +644,7 @@ class OAuthProxyBroker:
             created_at=issued_at,
         )
         async with self._state_lock:
+            self._cleanup_expired_if_due()
             if not self._has_capacity(len(self._clients), _MAX_REGISTERED_CLIENTS):
                 return self._oauth_error(
                     "temporarily_unavailable",

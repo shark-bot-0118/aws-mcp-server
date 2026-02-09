@@ -16,6 +16,7 @@ from starlette.responses import Response
 from ..auth.context import SENSITIVE_FIELDS, get_request_context_optional
 from ..auth.idp_config import AuditConfig
 from ..middleware.security import get_client_ip
+from ..utils.masking import redact_sensitive_fields
 
 logger = logging.getLogger(__name__)
 
@@ -40,29 +41,20 @@ def _get_mask_pattern(field: str) -> re.Pattern:
 
 
 def mask_sensitive_data(data: Any, mask_fields: frozenset[str], depth: int = 0) -> Any:
-    """
-    Recursively mask sensitive fields in data structures.
+    """Recursively mask sensitive fields in data structures.
 
-    Handles:
-    - Dictionaries: masks values of sensitive keys
-    - Lists: recursively processes items
-    - Strings: masks patterns like "field": "value"
+    Delegates dict/list masking to the shared ``redact_sensitive_fields``
+    utility.  String-level regex masking (for log messages) remains here.
     """
     if depth >= _MAX_MASK_DEPTH:
         return "***MASKED***"
     if isinstance(data, dict):
-        result = {}
-        for key, value in data.items():
-            lower_key = key.lower()
-            if lower_key in mask_fields or any(f in lower_key for f in mask_fields):
-                result[key] = "***MASKED***"
-            else:
-                result[key] = mask_sensitive_data(value, mask_fields, depth + 1)
-        return result
+        return redact_sensitive_fields(
+            data, mask="***MASKED***", depth=depth, max_depth=_MAX_MASK_DEPTH,
+        )
     elif isinstance(data, list):
         return [mask_sensitive_data(item, mask_fields, depth + 1) for item in data]
     elif isinstance(data, str):
-        # Mask patterns in strings
         masked = data
         for field in mask_fields:
             pattern = _get_mask_pattern(field)
@@ -115,7 +107,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Generate request ID if not present
-        request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+        request_id = _sanitize_log_value(request.headers.get("x-request-id", str(uuid.uuid4())))
         start_time = time.time()
 
         # Get client info
@@ -158,6 +150,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
             ctx = get_request_context_optional()
             if ctx:
                 user_id = ctx.user_id
+            safe_user_id = _sanitize_log_value(user_id)
 
             # Log request end
             if error_message:
@@ -165,7 +158,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                     "REQUEST_END request_id=%s user_id=%s method=%s path=%s "
                     "status=%s duration_ms=%d error=%s",
                     request_id,
-                    user_id,
+                    safe_user_id,
                     request.method,
                     safe_path,
                     status_code,
@@ -177,7 +170,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                     "REQUEST_END request_id=%s user_id=%s method=%s path=%s "
                     "status=%s duration_ms=%d",
                     request_id,
-                    user_id,
+                    safe_user_id,
                     request.method,
                     safe_path,
                     status_code,

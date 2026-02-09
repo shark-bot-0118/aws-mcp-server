@@ -146,7 +146,7 @@ def _create_client_with_profile(
     region: str | None,
     profile: str | None,
     settings: Settings,
-):
+) -> object:
     session = boto3.Session(
         profile_name=profile or settings.aws.default_profile,
         region_name=region or settings.aws.default_region,
@@ -160,7 +160,7 @@ def _create_client_with_credentials(
     ctx: RequestContext,
     region: str | None,
     settings: Settings,
-):
+) -> object:
     creds = _require_aws_credentials(ctx)
     session = boto3.Session(
         aws_access_key_id=creds.access_key_id,
@@ -233,11 +233,11 @@ def _read_streaming_fields(
 
 
 def _call_method(
-    client,
+    client: object,
     method_name: str,
     kwargs: dict[str, object],
     max_output_characters: int,
-):
+) -> dict[str, object]:
     method = getattr(client, method_name)
     response = method(**kwargs)
     if isinstance(response, dict):
@@ -254,16 +254,16 @@ async def get_client_async(
     region: str | None,
     profile: str | None = None,
     ctx: RequestContext | None = None,
-):
+) -> object:
     return await asyncio.to_thread(get_client, service, region, profile, ctx)
 
 
 async def call_aws_api_async(
-    client,
+    client: object,
     method_name: str,
     max_output_characters: int,
-    **kwargs,
-):
+    **kwargs: object,
+) -> dict[str, object]:
     return await asyncio.to_thread(
         _call_method,
         client,

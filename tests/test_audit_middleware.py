@@ -118,6 +118,29 @@ async def test_dispatch_success_logs_end(caplog: pytest.LogCaptureFixture) -> No
 
 
 @pytest.mark.asyncio
+async def test_dispatch_sanitizes_request_and_user_ids(caplog: pytest.LogCaptureFixture) -> None:
+    middleware = AuditMiddleware(
+        AsyncMock(),
+        AuditConfig(enabled=True),
+        trust_forwarded_headers=False,
+    )
+    caplog.set_level(logging.INFO)
+
+    ctx_token = set_request_context(RequestContext(user_id="user-\n1", issuer="iss"))
+    try:
+        response = await middleware.dispatch(
+            _request(headers={"x-request-id": "req-\n1"}),
+            AsyncMock(return_value=JSONResponse({"ok": True}, status_code=200)),
+        )
+    finally:
+        reset_request_context(ctx_token)
+
+    assert response.status_code == 200
+    assert "REQUEST_START request_id=req-_1" in caplog.text
+    assert "REQUEST_END request_id=req-_1 user_id=user-_1" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_dispatch_exception_masks_error(caplog: pytest.LogCaptureFixture) -> None:
     middleware = AuditMiddleware(
         AsyncMock(),
@@ -150,6 +173,24 @@ def test_mask_sensitive_data_depth_limit() -> None:
     for _ in range(_MAX_MASK_DEPTH):
         current = current["nested"]
     assert current == "***MASKED***"
+
+
+def test_mask_sensitive_data_top_level_list_and_primitive() -> None:
+    """Cover list, depth-limit and else branches at the top level of mask_sensitive_data."""
+    from aws_cli_mcp.middleware.audit import _MAX_MASK_DEPTH
+
+    fields = frozenset({"token"})
+
+    # Top-level list
+    masked_list = mask_sensitive_data([{"token": "x"}, "plain"], fields)
+    assert masked_list[0]["token"] == "***MASKED***"
+    assert masked_list[1] == "plain"
+
+    # Top-level primitive (else branch)
+    assert mask_sensitive_data(42, fields) == 42
+
+    # Top-level depth overflow
+    assert mask_sensitive_data({"a": 1}, fields, depth=_MAX_MASK_DEPTH) == "***MASKED***"
 
 
 def test_public_mask_data_method() -> None:

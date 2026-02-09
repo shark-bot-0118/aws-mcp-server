@@ -99,6 +99,14 @@ async def _handle_batch(payloads: list[object], request: Request) -> Response:
             code="batch_too_large",
             protocol_version=_protocol_version(request),
         )
+    if not payloads:
+        return _error_response(
+            None,
+            "Invalid JSON-RPC batch request",
+            status_code=400,
+            code="invalid_request",
+            protocol_version=_protocol_version(request),
+        )
 
     responses: list[dict[str, object]] = []
     for item in payloads:

@@ -73,7 +73,7 @@ class CredentialCache:
 
         try:
             creds = await refresh_fn()
-        except Exception as exc:
+        except BaseException as exc:
             async with self._lock:
                 future = self._in_flight.pop(key, None)
                 if future and not future.done():

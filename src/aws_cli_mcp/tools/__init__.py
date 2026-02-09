@@ -8,7 +8,8 @@ This module registers the 3 unified AWS tools:
 
 from __future__ import annotations
 
-from aws_cli_mcp.logging_utils import get_logger
+import logging
+
 from aws_cli_mcp.mcp_runtime import MCPServer, ToolSpec
 from aws_cli_mcp.tools.aws_unified import (
     execute_tool,
@@ -39,7 +40,7 @@ def register_tools(server: MCPServer) -> None:
     - aws_get_operation_schema
     - aws_execute
     """
-    logger = get_logger(__name__)
+    logger = logging.getLogger(__name__)
     logger.info("Registering unified AWS tools (3-tool architecture)")
 
     for tool in get_tool_specs():
