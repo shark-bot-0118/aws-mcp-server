@@ -958,14 +958,25 @@ class TestOAuthProxyBroker:
         )
         assert too_long_client.status_code == 400
 
-        unregistered_client = await broker.token(
-            self._request(
-                "/token",
-                method="POST",
-                body="grant_type=refresh_token&refresh_token=rt&client_id=unknown",
+        with (
+            patch.object(
+                broker,
+                "_discover_upstream_oidc",
+                return_value={"token_endpoint": "https://idp/token"},
+            ),
+            patch(
+                "httpx.AsyncClient.post",
+                return_value=MagicMock(status_code=200, json=lambda: {"access_token": "at"}),
+            ),
+        ):
+            unregistered_client = await broker.token(
+                self._request(
+                    "/token",
+                    method="POST",
+                    body="grant_type=refresh_token&refresh_token=rt&client_id=unknown",
+                )
             )
-        )
-        assert unregistered_client.status_code == 401
+        assert unregistered_client.status_code == 200
 
         client_id = "refresh-client"
         broker._clients[client_id] = RegisteredClient(

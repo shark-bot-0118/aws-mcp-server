@@ -558,12 +558,15 @@ class OAuthProxyBroker:
 
             async with self._state_lock:
                 registration = self._clients.get(client_id)
-            if registration is None:
-                return self._oauth_error("invalid_client", "client is not registered", 401)
-            if registration.token_endpoint_auth_method == "client_secret_post":
+            if registration and registration.token_endpoint_auth_method == "client_secret_post":
                 expected_secret = registration.client_secret or ""
                 if not client_secret or not secrets.compare_digest(client_secret, expected_secret):
                     return self._oauth_error("invalid_client", "client_secret mismatch", 401)
+            if registration is None:
+                _logger.info(
+                    "refresh request for unknown client_id=%s; attempting upstream refresh",
+                    client_id[:64],
+                )
 
             metadata = await self._discover_upstream_oidc()
             token_endpoint = metadata.get("token_endpoint")

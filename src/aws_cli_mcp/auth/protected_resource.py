@@ -52,6 +52,24 @@ class ProtectedResourceEndpoint:
         )
         self._metadata = self._build_metadata()
 
+    @staticmethod
+    def _is_gemini_cli_request(request: Request | None) -> bool:
+        if request is None:
+            return False
+        user_agent = request.headers.get("user-agent", "")
+        return "gemini" in user_agent.lower()
+
+    @staticmethod
+    def _normalize_nested_metadata_path(path: str) -> str:
+        """Normalize duplicated well-known prefixes emitted by some clients."""
+        duplicate = (
+            "/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource/"
+        )
+        if path.startswith(duplicate):
+            suffix = path[len(duplicate) :]
+            return f"/.well-known/oauth-protected-resource/{suffix}"
+        return path
+
     def _origin(self, request: Request | None = None) -> str | None:
         if self._public_base_url:
             return self._public_base_url
@@ -75,6 +93,11 @@ class ProtectedResourceEndpoint:
         origin = self._origin(request)
         if origin is None:
             return configured
+
+        if self._is_gemini_cli_request(request) and request is not None:
+            normalized_path = self._normalize_nested_metadata_path(request.url.path)
+            if normalized_path.startswith("/.well-known/oauth-protected-resource/"):
+                return f"{origin}{normalized_path}"
 
         return f"{origin}/mcp"
 

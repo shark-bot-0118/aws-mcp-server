@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from aws_cli_mcp.app import get_app_context
+from aws_cli_mcp.app import AppContext, get_app_context
 from aws_cli_mcp.audit.models import AuditOpRecord, AuditTxRecord
 from aws_cli_mcp.auth.context import get_request_context_optional
 from aws_cli_mcp.domain.operations import OperationRef
@@ -143,7 +143,7 @@ def get_operation_schema(payload: dict[str, object]) -> ToolResult:
 
 
 async def _record_audit_log(
-    ctx: object,
+    ctx: AppContext,
     tx_id: str,
     op_id: str,
     service: str,

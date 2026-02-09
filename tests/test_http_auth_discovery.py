@@ -169,6 +169,7 @@ def test_missing_token_challenge_contains_discovery_metadata() -> None:
         assert response.status_code == 401
         header = response.headers["www-authenticate"]
         assert 'realm="mcp"' in header
+        assert 'resource="http://testserver/mcp"' in header
         expected_metadata = (
             'resource_metadata="http://testserver/.well-known/oauth-protected-resource/mcp"'
         )
@@ -202,6 +203,7 @@ def test_missing_token_challenge_expands_resource_template_scope() -> None:
         )
         assert response.status_code == 401
         header = response.headers["www-authenticate"]
+        assert 'resource="https://mcp.local.test/mcp"' in header
         assert 'scope="openid https://mcp.local.test/mcp/aws.execute"' in header
 
 
@@ -232,8 +234,41 @@ def test_missing_token_challenge_uses_public_base_url() -> None:
         )
         assert response.status_code == 401
         header = response.headers["www-authenticate"]
+        assert 'resource="https://mcp.public.example.com/mcp"' in header
         assert (
             'resource_metadata="https://mcp.public.example.com/.well-known/oauth-protected-resource/mcp"'
             in header
         )
         assert 'scope="openid https://mcp.public.example.com/mcp/aws.execute"' in header
+
+
+def test_protected_resource_gemini_user_agent_uses_metadata_path() -> None:
+    config = _build_config("auto")
+    endpoint = create_protected_resource_endpoint(config, trust_forwarded_headers=True)
+    app = Starlette(
+        routes=[
+            Route(
+                "/.well-known/oauth-protected-resource/{resource_path:path}",
+                endpoint=endpoint.handle,
+                methods=["GET"],
+            )
+        ]
+    )
+
+    headers = {
+        "User-Agent": "gemini-cli/0.1",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "mcp.local.test",
+    }
+    expected = "https://mcp.local.test/.well-known/oauth-protected-resource/mcp"
+    with TestClient(app) as client:
+        response = client.get("/.well-known/oauth-protected-resource/mcp", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["resource"] == expected
+
+        nested = client.get(
+            "/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource/mcp",
+            headers=headers,
+        )
+        assert nested.status_code == 200
+        assert nested.json()["resource"] == expected

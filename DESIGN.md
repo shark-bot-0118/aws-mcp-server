@@ -2,7 +2,7 @@
 
 ## Meta
 - **Project Title:** AWS Tool-Execution MCP Server
-- **Version:** 3.21
+- **Version:** 3.22
 - **Last Updated:** 2026-02-09
 - **Document Role:** Architecture / design SSOT
 - **History & Versioning:** `/Users/shuto/Projects/mcp_server/aws_cli_v2/HISTORY.md`
@@ -721,6 +721,12 @@ Validate and invoke AWS operations.
   - all user-controlled log fields (including request IDs and principal IDs) must be sanitized before emission.
 - OAuth proxy cleanup policy:
   - in-memory transaction/code/client cleanup must be interval-driven (not full-map rebuild on every request) to avoid O(n) hot-path cost.
+- Gemini CLI OAuth discovery compatibility policy:
+  - `WWW-Authenticate` challenge should include explicit `resource` alongside `resource_metadata` to reduce client-side resource expectation ambiguity.
+  - Protected-resource metadata routes should tolerate nested `/.well-known/oauth-protected-resource/...` discovery probes and remain publicly accessible (no auth/rate-limit gate).
+  - OAuth proxy refresh flow should allow stateless upstream refresh for unknown local `client_id` to survive broker restarts without forced manual re-registration.
+- MCP transport compatibility policy:
+  - `/mcp` must accept `GET/HEAD` at routing level and return structured MCP JSON-RPC `method_not_allowed` responses from handler, avoiding framework-generated plain 405 responses.
 - Optional advisory jobs may exist for experiments, but merge safety must not depend on runtime flags.
 - Local SCA verification should run with the project virtualenv binary
   (`.venv/bin/pip-audit --progress-spinner off`) to avoid host PATH drift.

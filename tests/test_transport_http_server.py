@@ -95,6 +95,8 @@ def test_create_http_app_multi_idp(mock_settings, mock_idp_config, mock_deps):
     assert "/mcp" in routes
     assert "/health" in routes
     assert "/ready" in routes
+    mcp_route = next(r for r in app.routes if getattr(r, "path", "") == "/mcp")
+    assert "GET" in mcp_route.methods
 
 
 def test_create_http_app_identity_center(mock_settings):
@@ -182,6 +184,27 @@ def test_multi_idp_auth_middleware_success():
     assert response.status_code == 200
 
 
+def test_multi_idp_auth_middleware_exempts_protected_resource_prefix():
+    app = MagicMock()
+    validator = AsyncMock()
+    middleware = MultiIdPAuthMiddleware(app, validator)
+
+    async def call_next(_request):
+        return JSONResponse({"status": "ok"})
+
+    request = Request(
+        scope={
+            "type": "http",
+            "headers": [],
+            "path": "/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource/mcp",
+        }
+    )
+
+    response = asyncio.run(middleware.dispatch(request, call_next))
+    assert response.status_code == 200
+    validator.validate.assert_not_called()
+
+
 def test_multi_idp_credential_middleware_no_context():
     app = MagicMock()
     mapper = MagicMock()
@@ -247,6 +270,27 @@ def test_multi_idp_credential_middleware_success():
         assert response.status_code == 200
     finally:
         reset_request_context(token)
+
+
+def test_multi_idp_credential_middleware_exempts_protected_resource_prefix():
+    app = MagicMock()
+    mapper = MagicMock()
+    cache = MagicMock()
+    sts = MagicMock()
+    middleware = MultiIdPAWSCredentialMiddleware(app, mapper, cache, sts)
+
+    async def call_next(_request):
+        return JSONResponse({"status": "ok"})
+
+    request = Request(
+        scope={
+            "type": "http",
+            "path": "/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource/mcp",
+            "headers": [],
+        }
+    )
+    response = asyncio.run(middleware.dispatch(request, call_next))
+    assert response.status_code == 200
 
 
 def test_multi_idp_credential_middleware_credential_error():

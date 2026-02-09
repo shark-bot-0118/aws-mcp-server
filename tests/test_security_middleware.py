@@ -158,6 +158,22 @@ class TestPreAuthSecurityMiddleware:
                 response = client.get("/health")
                 assert response.status_code == 200
 
+    def test_protected_resource_prefix_bypasses_security(self) -> None:
+        """Nested protected-resource metadata paths should bypass security checks."""
+        config = _create_security_config(rate_limit_per_ip=1)
+
+        async def app(scope, receive, send):
+            response = JSONResponse({"status": "ok"})
+            await response(scope, receive, send)
+
+        middleware = PreAuthSecurityMiddleware(app, config)
+        with closing(TestClient(middleware)) as client:
+            for _ in range(5):
+                response = client.get(
+                    "/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource/mcp"
+                )
+                assert response.status_code == 200
+
     def test_ip_rate_limit_applies_before_auth(self) -> None:
         """IP rate limiting should work even without authentication."""
         config = _create_security_config(rate_limit_per_ip=2)
@@ -502,6 +518,24 @@ class TestUserRateLimitMiddleware:
             # Health endpoint should always work even with user_id
             for _ in range(10):
                 response = client.get("/health")
+                assert response.status_code == 200
+
+    def test_protected_resource_prefix_bypasses_user_rate_limit(self) -> None:
+        """Nested protected-resource metadata paths should bypass user rate limiting."""
+        config = _create_security_config(rate_limit_per_user=1)
+
+        async def app(scope, receive, send):
+            request = Request(scope, receive, send)
+            request.state.user_id = "test-user"
+            response = JSONResponse({"status": "ok"})
+            await response(scope, receive, send)
+
+        middleware = UserRateLimitMiddleware(app, config)
+        with closing(TestClient(middleware)) as client:
+            for _ in range(5):
+                response = client.get(
+                    "/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource/mcp"
+                )
                 assert response.status_code == 200
 
     @pytest.mark.asyncio

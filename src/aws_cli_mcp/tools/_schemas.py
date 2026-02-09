@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from aws_cli_mcp.mcp_runtime import ToolSpec
+from collections.abc import Awaitable, Callable
+
+from aws_cli_mcp.mcp_runtime import ToolResult, ToolSpec
+
+ToolHandler = Callable[[dict[str, object]], ToolResult | Awaitable[ToolResult]]
 
 SEARCH_SCHEMA = {
     "type": "object",
@@ -130,9 +134,9 @@ EXECUTE_SCHEMA = {
 
 
 def make_tool_specs(
-    search_handler: object,
-    get_schema_handler: object,
-    execute_handler: object,
+    search_handler: ToolHandler,
+    get_schema_handler: ToolHandler,
+    execute_handler: ToolHandler,
 ) -> tuple[ToolSpec, ToolSpec, ToolSpec]:
     """Create the 3 ToolSpec instances with the given handler callables."""
     search_operations_tool = ToolSpec(

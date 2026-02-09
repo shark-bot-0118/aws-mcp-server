@@ -40,6 +40,13 @@ _BASE_EXEMPT_PATHS = frozenset(
         "/.well-known/oauth-protected-resource/mcp",
     }
 )
+_BASE_EXEMPT_PREFIXES = ("/.well-known/oauth-protected-resource/",)
+
+
+def _is_exempt_path(path: str, exempt_paths: set[str] | frozenset[str]) -> bool:
+    if path in exempt_paths:
+        return True
+    return any(path.startswith(prefix) for prefix in _BASE_EXEMPT_PREFIXES)
 
 
 async def _mcp_handler(request: Request) -> Response:
@@ -59,7 +66,7 @@ async def _ready_handler(request: Request) -> Response:
 def _base_routes() -> list[Route]:
     """Common routes shared by all auth modes."""
     return [
-        Route("/mcp", endpoint=_mcp_handler, methods=["POST", "OPTIONS"]),
+        Route("/mcp", endpoint=_mcp_handler, methods=["GET", "POST", "OPTIONS"]),
         Route("/health", endpoint=_health_handler, methods=["GET"]),
         Route("/ready", endpoint=_ready_handler, methods=["GET"]),
     ]
@@ -227,6 +234,11 @@ def _create_multi_idp_app(settings: Any) -> Starlette:
             ),
             Route(
                 "/.well-known/oauth-protected-resource/mcp",
+                endpoint=protected_resource_endpoint.handle,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-protected-resource/{resource_path:path}",
                 endpoint=protected_resource_endpoint.handle,
                 methods=["GET"],
             ),
@@ -407,6 +419,7 @@ class MultiIdPAuthMiddleware(BaseHTTPMiddleware):
 
     def _build_authenticate_header(self, request: Request, error: str | None = None) -> str:
         parts = ['realm="mcp"']
+        parts.append(f'resource="{self._resolve_challenge_resource(request)}"')
         parts.append(f'resource_metadata="{self._build_resource_metadata_url(request)}"')
         resolved_scopes = self._resolve_challenge_scopes(request)
         if resolved_scopes:
@@ -418,7 +431,7 @@ class MultiIdPAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         # Skip auth for exempt paths
-        if request.url.path in self.exempt_paths:
+        if _is_exempt_path(request.url.path, self.exempt_paths):
             return await call_next(request)
 
         # Extract token from Authorization header
@@ -527,7 +540,7 @@ class MultiIdPAWSCredentialMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         # Skip for exempt paths
-        if request.url.path in self.exempt_paths:
+        if _is_exempt_path(request.url.path, self.exempt_paths):
             return await call_next(request)
 
         # Get current context

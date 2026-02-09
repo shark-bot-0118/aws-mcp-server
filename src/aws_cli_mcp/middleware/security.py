@@ -25,6 +25,13 @@ _SECURITY_EXEMPT_PATHS = frozenset(
         "/.well-known/oauth-protected-resource/mcp",
     }
 )
+_SECURITY_EXEMPT_PREFIXES = ("/.well-known/oauth-protected-resource/",)
+
+
+def _is_security_exempt_path(path: str, exempt_paths: frozenset[str]) -> bool:
+    if path in exempt_paths:
+        return True
+    return any(path.startswith(prefix) for prefix in _SECURITY_EXEMPT_PREFIXES)
 
 
 class BodySizeLimitExceeded(Exception):
@@ -183,7 +190,7 @@ class PreAuthSecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Process request with pre-auth security checks."""
         # Skip security for exempt paths
-        if request.url.path in self.EXEMPT_PATHS:
+        if _is_security_exempt_path(request.url.path, self.EXEMPT_PATHS):
             return await call_next(request)
 
         # 1. Request size check
@@ -331,7 +338,7 @@ class UserRateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Process request with user rate limiting."""
         # Skip for exempt paths
-        if request.url.path in self.EXEMPT_PATHS:
+        if _is_security_exempt_path(request.url.path, self.EXEMPT_PATHS):
             return await call_next(request)
 
         # User-based rate limit (if user is authenticated)
